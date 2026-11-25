@@ -8,6 +8,7 @@ The web version of SnapEnhance
 - [x] Remove blur / away state when unfocused
 - [x] Disable conversation read receipts
 - [x] Disable story read receipts
+- [x] Open snaps anonymously (they stay unopened for the sender; also blocks saving/reacting/deleting from the web)
 - [x] Hide bitmoji and typing indicator (blocks presence messages only)
 - [x] Block Snapchat tracking (analytics, error reports)
 - [x] Settings panel in English or French, draggable button

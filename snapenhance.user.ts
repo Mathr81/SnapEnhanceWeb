@@ -2,7 +2,7 @@
 // @name         SnapEnhance Web
 // @namespace    snapenhance-web
 // @description  A userscript to Enhance the User experience on Snapchat Web
-// @version      1.4.0
+// @version      1.5.0
 // @author       SnapEnhance
 // @source       https://github.com/Mathr81/SnapEnhanceWeb/
 // @license      GPL-3.0-only
@@ -16,7 +16,7 @@
 // ==/UserScript==
 (function () {
     "use strict";
-    const VERSION = "1.4.0";
+    const VERSION = "1.5.0";
     const STORAGE_KEY = "snapenhance-web:settings";
     const BLOCKLIST_KEY = "snapenhance-web:blocklist";
     const POSITION_KEY = "snapenhance-web:button-position";
@@ -29,6 +29,7 @@
         uploadSizeBypass: [t("Bypass upload size", "Pas de limite de taille"), t("Send files bigger than Snapchat's limit", "Envoyer des fichiers plus gros que la limite de Snapchat"), true],
         storyReadReceipts: [t("Hide story views", "Vues de story invisibles"), t("Watch stories without showing up in viewers", "Regarder les stories sans apparaître dans les vues"), true],
         chatReadReceipts: [t("Hide chat read receipts", "Pas d'accusé de lecture"), t("Read messages without marking them as seen", "Lire les messages sans qu'ils passent en « Vu »"), true],
+        snapReadReceipts: [t("Open snaps anonymously", "Ouvrir les snaps en anonyme"), t("Red/purple snaps stay unopened for the sender. Also blocks saving, reacting and deleting messages", "Les snaps rouges/violets restent « non ouverts » chez l'envoyeur. Bloque aussi enregistrer, réagir et supprimer un message"), true],
         hideBitmoji: [t("Hide bitmoji & typing", "Cacher bitmoji et « écrit… »"), t("Friends don't see you in the chat or typing (blocks presence messages)", "Tes amis ne te voient pas dans le chat ni en train d'écrire"), true],
         screenshotBypass: [t("Bypass screenshot detection", "Captures d'écran non détectées"), t("PrintScreen, Win/Cmd+Shift, Ctrl+Shift and right-click no longer trigger it", "Impr. écran, Win/Cmd+Maj, Ctrl+Maj et clic droit ne déclenchent plus rien"), true],
         alwaysFocused: [t("Stay focused", "Toujours actif"), t("No blur or away state when you switch windows", "Pas de flou ni d'état « absent » quand tu changes de fenêtre"), true],
@@ -93,6 +94,8 @@
         const blocked = [...extra];
         if (s.chatReadReceipts) blocked.push("messagingcoreservice.MessagingCoreService/UpdateConversation");
         if (s.hideBitmoji) blocked.push("messagingcoreservice.MessagingCoreService/SendTypingNotification");
+        // Per-message state (viewed, replayed, saved, reacted...): no way to tell actions apart without decoding protobuf
+        if (s.snapReadReceipts) blocked.push("MessagingCoreService/UpdateContentMessage", "MessagingCoreService/BatchUpdateContentMessages");
         if (s.blockTracking) blocked.push(...tracking);
 
         if (s.hideBitmoji) {
@@ -251,6 +254,13 @@
         header .ver { color: #888; font-size: 11px; }
         header .close { margin-left: auto; background: none; border: none; color: #aaa; font-size: 20px; cursor: pointer; line-height: 1; }
         .list { overflow-y: auto; padding: 4px 0; }
+        /* Chrome ignores ::-webkit-scrollbar (and shows arrows) once scrollbar-color is set: Firefox only */
+        @supports not selector(::-webkit-scrollbar) { .list, textarea { scrollbar-width: thin; scrollbar-color: #3a3c42 transparent; } }
+        ::-webkit-scrollbar { width: 8px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: #3a3c42; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #55575e; }
+        ::-webkit-scrollbar-button { display: none; }
         label { display: flex; align-items: center; gap: 12px; padding: 9px 14px; cursor: pointer; }
         label:hover { background: #1f2125; }
         label span { flex: 1; display: flex; flex-direction: column; gap: 2px; }

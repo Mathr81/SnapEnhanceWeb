@@ -24,6 +24,7 @@ A userscript that adds privacy and media features to [Snapchat Web](https://www.
 | Feature | What it does |
 |---|---|
 | Download button | Hover an image, video, story, snap or voice note and click ⬇ to save it. |
+| Full-length videos | Long videos arrive as 10-second snaps: the ⬇ button (shown with ×N) joins all the parts into one MP4, in the original quality and without re-encoding. |
 | Download all | Saves every media file loaded in the open conversation in one click. |
 | Keep deleted messages | A message deleted while the conversation is open stays visible, faded, with a 🗑 label. |
 | Bypass upload size | Send files bigger than Snapchat's limit. |

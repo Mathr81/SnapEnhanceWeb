@@ -2,7 +2,7 @@
 // @name         SnapEnhance Web
 // @namespace    snapenhance-web
 // @description  A userscript to Enhance the User experience on Snapchat Web
-// @version      1.3.0
+// @version      1.4.0
 // @author       SnapEnhance
 // @source       https://github.com/Mathr81/SnapEnhanceWeb/
 // @license      GPL-3.0-only
@@ -16,22 +16,25 @@
 // ==/UserScript==
 (function () {
     "use strict";
-    const VERSION = "1.3.0";
+    const VERSION = "1.4.0";
     const STORAGE_KEY = "snapenhance-web:settings";
     const BLOCKLIST_KEY = "snapenhance-web:blocklist";
+    const POSITION_KEY = "snapenhance-web:button-position";
+
+    const FR = /^fr\b/i.test(navigator.language);
+    const t = (en: string, fr: string) => (FR ? fr : en);
 
     // [label, description, default]
     const FEATURES = {
-        uploadSizeBypass: ["Bypass upload size", "Send files bigger than Snapchat's limit", true],
-        storyReadReceipts: ["Hide story views", "Watch stories without showing up in viewers", true],
-        chatReadReceipts: ["Hide chat read receipts", "Read messages without marking them as seen", true],
-        typingNotification: ["Hide typing indicator", "Friends don't see that you're typing", true],
-        hideBitmoji: ["Hide bitmoji in chat", "Blocks all outgoing websocket messages (presence)", true],
-        mediaDownload: ["Allow media download", "Download button on hover + right-click to save images, videos, voice notes", true],
-        alwaysFocused: ["Stay focused", "No blur or away state when you switch windows", true],
-        screenshotBypass: ["Bypass screenshot detection", "Ignores screenshot key combos (PrintScreen, Win/Cmd)", true],
-        screenshotStrict: ["Strict screenshot mode", "Use if the above fails: blocks ALL page key listeners (Enter to send stops working)", false],
-        debug: ["Debug logs", "Log blocked requests in the console", false],
+        uploadSizeBypass: [t("Bypass upload size", "Pas de limite de taille"), t("Send files bigger than Snapchat's limit", "Envoyer des fichiers plus gros que la limite de Snapchat"), true],
+        storyReadReceipts: [t("Hide story views", "Vues de story invisibles"), t("Watch stories without showing up in viewers", "Regarder les stories sans apparaître dans les vues"), true],
+        chatReadReceipts: [t("Hide chat read receipts", "Pas d'accusé de lecture"), t("Read messages without marking them as seen", "Lire les messages sans qu'ils passent en « Vu »"), true],
+        hideBitmoji: [t("Hide bitmoji & typing", "Cacher bitmoji et « écrit… »"), t("Friends don't see you in the chat or typing (blocks presence messages)", "Tes amis ne te voient pas dans le chat ni en train d'écrire"), true],
+        screenshotBypass: [t("Bypass screenshot detection", "Captures d'écran non détectées"), t("PrintScreen, Win/Cmd+Shift, Ctrl+Shift and right-click no longer trigger it", "Impr. écran, Win/Cmd+Maj, Ctrl+Maj et clic droit ne déclenchent plus rien"), true],
+        alwaysFocused: [t("Stay focused", "Toujours actif"), t("No blur or away state when you switch windows", "Pas de flou ni d'état « absent » quand tu changes de fenêtre"), true],
+        mediaDownload: [t("Media download", "Téléchargement des médias"), t("Download button on images, videos, stories and voice notes", "Bouton de téléchargement sur images, vidéos, stories et notes vocales"), true],
+        blockTracking: [t("Block tracking", "Bloquer le pistage"), t("Blocks Snapchat analytics and error reports", "Bloque les statistiques et rapports d'erreurs envoyés à Snapchat"), true],
+        debug: [t("Debug logs", "Logs de débogage"), t("Log blocked requests in the console", "Affiche les requêtes bloquées dans la console"), false],
     } as const;
     type Key = keyof typeof FEATURES;
     type Settings = Record<Key, boolean>;
@@ -61,31 +64,51 @@
         Object.defineProperty(File.prototype, "size", { get: () => 500 });
     }
 
-    // ---- Story read receipts + custom blocklist (main thread)
+    // ---- Main thread requests: story views, tracking, custom blocklist
+    const TRACKING = ["web-blizzard/web/send", "/graphene/web", "sentry.sc-prod.net", "/web/metrics"];
     const mainBlocked = [...customBlocked];
     if (settings.storyReadReceipts) mainBlocked.push("readreceipt-indexer/batchuploadreadreceipts");
+    if (settings.blockTracking) mainBlocked.push(...TRACKING);
+    const isBlocked = (url: string) => mainBlocked.some((b) => url.includes(b));
     if (mainBlocked.length) {
         const origFetch = window.fetch;
         window.fetch = function (...args: any[]) {
             const url = urlOf(args[0]);
-            if (mainBlocked.some((b) => url.includes(b))) {
+            if (isBlocked(url)) {
                 log("blocked", url);
                 return Promise.resolve(new Response(null, { status: 200 }));
             }
             return origFetch.apply(window, args as any);
         };
+        const origBeacon = navigator.sendBeacon;
+        navigator.sendBeacon = function (url: any, data?: any) {
+            if (isBlocked(urlOf(url))) return log("blocked beacon", url), true;
+            return origBeacon.call(navigator, url, data);
+        };
     }
 
-    // ---- Worker hooks (chat read receipts, typing, bitmoji). Runs inside the worker: must be self-contained.
-    function workerInjected(s: Settings, extra: string[]) {
+    // ---- Worker hooks (chat read receipts, presence/typing). Runs inside the worker: must be self-contained.
+    function workerInjected(s: Settings, extra: string[], tracking: string[]) {
         const wlog = (...a: any[]) => s.debug && console.log("[SnapEnhance worker]", ...a);
         const blocked = [...extra];
-        if (s.typingNotification) blocked.push("messagingcoreservice.MessagingCoreService/SendTypingNotification");
         if (s.chatReadReceipts) blocked.push("messagingcoreservice.MessagingCoreService/UpdateConversation");
+        if (s.hideBitmoji) blocked.push("messagingcoreservice.MessagingCoreService/SendTypingNotification");
+        if (s.blockTracking) blocked.push(...tracking);
 
         if (s.hideBitmoji) {
-            WebSocket.prototype.send = function () {
-                wlog("blocked websocket send");
+            // Presence ("in chat", typing, screenshot flag) travels over the websocket as "...presence..." messages
+            const decoder = new TextDecoder("latin1");
+            const isPresence = (d: any) => {
+                try {
+                    return (typeof d === "string" ? d : decoder.decode(d)).includes("presence");
+                } catch {
+                    return false;
+                }
+            };
+            const origSend = WebSocket.prototype.send;
+            WebSocket.prototype.send = function (data: any) {
+                if (isPresence(data)) return wlog("blocked presence");
+                return origSend.call(this, data);
             };
         }
 
@@ -105,7 +128,8 @@
         constructor(parts?: any[], options?: BlobPropertyBag) {
             if (typeof parts?.[0] === "string" && parts[0].startsWith("importScripts")) {
                 parts = [...parts];
-                parts[0] += `;\nconst urlOf=${urlOf};(${workerInjected})(${JSON.stringify(settings)},${JSON.stringify(customBlocked)});\n`;
+                const args = [settings, customBlocked, TRACKING].map((a) => JSON.stringify(a)).join(",");
+                parts[0] += `;\nconst urlOf=${urlOf};(${workerInjected})(${args});\n`;
                 window.Blob = OrigBlob;
             }
             super(parts, options);
@@ -134,27 +158,26 @@
         Object.defineProperty(document, "visibilityState", { get: () => "visible" });
     }
 
-    const isScreenshotKey = (e: KeyboardEvent) => e.key === "PrintScreen" || e.key === "Meta" || e.metaKey;
+    // Mirrors Snapchat's detector: PrintScreen, or Shift with Ctrl/Meta held (Win+Shift+S, Cmd+Shift+4...)
+    const isScreenshotKey = (e: KeyboardEvent) => e.key === "PrintScreen" || (e.shiftKey && (e.metaKey || e.ctrlKey));
     const keyWrappers = new WeakMap<Function, Function>();
-    const isKeyEvent = (type: string) => type === "keydown" || type === "keyup";
 
     EventTarget.prototype.addEventListener = function (type: string, listener: any, options?: any) {
         if (settings.alwaysFocused && (this === window || this === document)
             && (type === "blur" || type === "focus" || type === "visibilitychange")) return;
-        if (isKeyEvent(type)) {
-            if (settings.screenshotStrict) return;
-            if (settings.screenshotBypass && typeof listener === "function") {
-                const original = listener;
-                let wrapped = keyWrappers.get(original);
-                if (!wrapped) {
-                    wrapped = function (this: any, e: KeyboardEvent) {
-                        if (isScreenshotKey(e)) return log("blocked screenshot key", e.key);
-                        return original.call(this, e);
-                    };
-                    keyWrappers.set(original, wrapped);
-                }
-                listener = wrapped;
+        // Snapchat flags any right-click on window as a screenshot attempt
+        if (settings.screenshotBypass && this === window && type === "contextmenu") return;
+        if (settings.screenshotBypass && (type === "keydown" || type === "keyup") && typeof listener === "function") {
+            const original = listener;
+            let wrapped = keyWrappers.get(original);
+            if (!wrapped) {
+                wrapped = function (this: any, e: KeyboardEvent) {
+                    if (isScreenshotKey(e)) return log("blocked screenshot key", e.key);
+                    return original.call(this, e);
+                };
+                keyWrappers.set(original, wrapped);
             }
+            listener = wrapped;
         }
         return origAdd.call(this, type, listener, options);
     };
@@ -162,20 +185,63 @@
         return origRemove.call(this, type, keyWrappers.get(listener) ?? listener, options);
     };
 
+    // ---- Media helpers
+    type Media = HTMLImageElement | HTMLMediaElement;
+    const BITMOJI = /bitmoji\.com|sc-cdn\.net\/3d\//;
+    const mediaSrc = (m: Media) => m.currentSrc || m.src || m.querySelector("source")?.src || "";
+    function isDownloadable(el: Element): el is Media {
+        if (!(el instanceof HTMLImageElement || el instanceof HTMLMediaElement)) return false;
+        const src = mediaSrc(el);
+        if (!src || BITMOJI.test(src)) return false;
+        const r = el.getBoundingClientRect();
+        return el instanceof HTMLAudioElement ? r.width > 0 : r.width >= 80 && r.height >= 80;
+    }
+
+    async function downloadMedia(m: Media) {
+        const src = mediaSrc(m);
+        if (!src) return;
+        try {
+            const blob = await (await fetch(src)).blob();
+            let ext = (blob.type.split("/")[1] || "bin").split(";")[0].replace("jpeg", "jpg").replace("mpeg", "mp3");
+            if (m instanceof HTMLAudioElement && ext === "mp4") ext = "m4a"; // voice notes are AAC in an mp4 container
+            const a = document.createElement("a");
+            a.href = URL.createObjectURL(blob);
+            a.download = `snapchat-${new Date().toISOString().replace(/[:.]/g, "-")}.${ext}`;
+            a.click();
+            setTimeout(() => URL.revokeObjectURL(a.href), 10_000);
+        } catch (err) {
+            // Cross-origin CDN without CORS: let the browser handle it
+            log("download failed, opening in a new tab", err);
+            window.open(src, "_blank");
+        }
+    }
+
+    async function downloadAll(): Promise<number> {
+        const seen = new Set<string>();
+        const media = [...document.querySelectorAll("img, video, audio")].filter(isDownloadable)
+            .filter((m) => !seen.has(mediaSrc(m)) && !!seen.add(mediaSrc(m)));
+        for (const m of media) {
+            await downloadMedia(m);
+            await new Promise((r) => setTimeout(r, 300)); // browsers drop bursts of downloads
+        }
+        return media.length;
+    }
+
     // ---- Settings GUI
     const CSS = `
         :host { all: initial; }
         * { box-sizing: border-box; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
         .fab {
-            position: fixed; left: 14px; bottom: 14px; z-index: 2147483647;
+            position: fixed; left: 14px; bottom: 14px; z-index: 2147483647; touch-action: none;
             width: 40px; height: 40px; border-radius: 50%; border: none; cursor: pointer;
             background: #FFFC00; font-size: 20px; line-height: 40px;
             box-shadow: 0 2px 10px rgba(0,0,0,.35); opacity: .55; transition: opacity .15s, transform .15s;
         }
         .fab:hover, .fab:focus-visible, .fab[aria-expanded="true"] { opacity: 1; transform: scale(1.06); }
+        .fab.dragging { cursor: grabbing; transition: none; }
         .panel {
-            position: fixed; left: 14px; bottom: 64px; z-index: 2147483647;
-            width: 340px; max-height: calc(100vh - 90px); display: flex; flex-direction: column;
+            position: fixed; z-index: 2147483647;
+            width: 340px; display: flex; flex-direction: column;
             background: #16171a; color: #eee; border: 1px solid #2c2e33; border-radius: 14px;
             box-shadow: 0 12px 40px rgba(0,0,0,.5); font-size: 13px; overflow: hidden;
         }
@@ -200,6 +266,13 @@
         input[type=checkbox]:checked { background: #e6e200; }
         input[type=checkbox]:checked::after { transform: translateX(14px); background: #111; }
         :focus-visible { outline: 2px solid #FFFC00; outline-offset: 2px; }
+        .tools { padding: 10px 14px; border-bottom: 1px solid #2c2e33; }
+        .dlall {
+            width: 100%; padding: 8px 12px; border: 1px solid #3a3c42; border-radius: 8px; cursor: pointer;
+            background: #1f2125; color: #eee; font-size: 12.5px; font-weight: 600;
+        }
+        .dlall:hover { border-color: #FFFC00; }
+        .dlall:disabled { opacity: .5; cursor: default; }
         footer { display: flex; align-items: center; gap: 8px; padding: 10px 14px; border-top: 1px solid #2c2e33; }
         footer .hint { flex: 1; color: #888; font-size: 11.5px; }
         footer .hint.dirty { color: #FFFC00; }
@@ -223,6 +296,7 @@
         .dl[hidden] { display: none; }
         @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
     `;
+    const HINT = t("Alt+Shift+S · drag 👻 to move it", "Alt+Maj+S · fais glisser 👻 pour le déplacer");
 
     function mountGui() {
         if (settings.mediaDownload) {
@@ -235,21 +309,24 @@
         const root = host.attachShadow({ mode: "closed" });
         root.innerHTML = `
             <style>${CSS}</style>
-            <button class="fab" aria-label="SnapEnhance settings" aria-expanded="false" title="SnapEnhance (Alt+Shift+S)">👻</button>
-            <div class="panel" role="dialog" aria-label="SnapEnhance settings" hidden>
+            <button class="fab" aria-label="SnapEnhance" aria-expanded="false" title="SnapEnhance (Alt+Shift+S)">👻</button>
+            <div class="panel" role="dialog" aria-label="SnapEnhance" hidden>
                 <header><b>SnapEnhance Web</b><span class="ver">v${VERSION}</span>
-                    <button class="close" aria-label="Close">×</button></header>
-                <div class="list">${Object.entries(FEATURES).map(([k, [label, desc]]) => `
+                    <button class="close" aria-label="${t("Close", "Fermer")}">×</button></header>
+                <div class="list">
+                    ${settings.mediaDownload ? `<div class="tools"><button class="dlall">${t("⬇ Download all media in this chat", "⬇ Télécharger tous les médias du chat")}</button></div>` : ""}
+                    ${Object.entries(FEATURES).map(([k, [label, desc]]) => `
                     <label><span>${label}<small>${desc}</small></span>
                     <input type="checkbox" role="switch" data-key="${k}"></label>`).join("")}
-                    <label class="custom" style="cursor:auto">Custom blocked requests
-                        <small>One URL fragment per line, copied from DevTools → Network. Use it to fix a feature after a Snapchat update.</small>
-                        <textarea spellcheck="false" placeholder="e.g. MessagingCoreService/UpdateConversation"></textarea></label>
+                    <label class="custom" style="cursor:auto">${t("Custom blocked requests", "Requêtes bloquées en plus")}
+                        <small>${t("One URL fragment per line, copied from DevTools → Network. Use it to fix a feature after a Snapchat update.",
+                                   "Un morceau d'URL par ligne, copié depuis F12 → Réseau. Sert à réparer une fonction après une mise à jour de Snapchat.")}</small>
+                        <textarea spellcheck="false" placeholder="ex. MessagingCoreService/UpdateConversation"></textarea></label>
                 </div>
-                <footer><span class="hint">Alt+Shift+S to toggle this panel</span>
-                    <button class="reset">Reset</button><button class="reload" disabled>Reload</button></footer>
+                <footer><span class="hint"></span>
+                    <button class="reset">${t("Reset", "Réinitialiser")}</button><button class="reload" disabled>${t("Reload", "Recharger")}</button></footer>
             </div>
-            <button class="dl" aria-label="Download media" title="Download" hidden>
+            <button class="dl" aria-label="${t("Download media", "Télécharger le média")}" title="${t("Download", "Télécharger")}" hidden>
                 <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.2"
                     stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v11M7 10l5 5 5-5M5 20h14"/></svg></button>`;
         document.body.append(host);
@@ -266,14 +343,62 @@
             boxes.forEach((b) => (b.checked = draft[b.dataset.key as Key]));
             const dirty = JSON.stringify(draft) !== saved || blocklist.value !== savedBlocklist;
             reload.disabled = !dirty;
-            hint.textContent = dirty ? "Reload to apply changes" : "Alt+Shift+S to toggle this panel";
+            hint.textContent = dirty ? t("Reload to apply changes", "Recharge pour appliquer") : HINT;
             hint.classList.toggle("dirty", dirty);
         };
+        const placePanel = () => {
+            const r = fab.getBoundingClientRect();
+            panel.style.left = `${Math.max(8, Math.min(r.left, innerWidth - 348))}px`;
+            const below = r.top < innerHeight / 2;
+            panel.style.top = below ? `${r.bottom + 10}px` : "auto";
+            panel.style.bottom = below ? "auto" : `${innerHeight - r.top + 10}px`;
+            panel.style.maxHeight = `${(below ? innerHeight - r.bottom : r.top) - 20}px`;
+        };
         const toggle = (open = panel.hidden) => {
+            if (open) placePanel();
             panel.hidden = !open;
             fab.setAttribute("aria-expanded", String(open));
             if (open) boxes[0].focus();
         };
+
+        // Draggable button, position remembered
+        const placeFab = (x: number, y: number) => {
+            fab.style.left = `${Math.max(4, Math.min(x, innerWidth - 44))}px`;
+            fab.style.top = `${Math.max(4, Math.min(y, innerHeight - 44))}px`;
+            fab.style.bottom = "auto";
+        };
+        try {
+            const p = JSON.parse(localStorage.getItem(POSITION_KEY) || "null");
+            if (p) placeFab(p.x, p.y);
+        } catch { /* ignore bad saved position */ }
+        let drag: { dx: number; dy: number; x0: number; y0: number } | null = null;
+        let dragged = false;
+        origAdd.call(fab, "pointerdown", (e: any) => {
+            const r = fab.getBoundingClientRect();
+            drag = { dx: e.clientX - r.left, dy: e.clientY - r.top, x0: e.clientX, y0: e.clientY };
+            dragged = false;
+            fab.setPointerCapture(e.pointerId);
+        });
+        origAdd.call(fab, "pointermove", (e: any) => {
+            if (!drag) return;
+            if (!dragged && Math.hypot(e.clientX - drag.x0, e.clientY - drag.y0) < 5) return;
+            dragged = true;
+            fab.classList.add("dragging");
+            placeFab(e.clientX - drag.dx, e.clientY - drag.dy);
+            if (!panel.hidden) placePanel();
+        });
+        origAdd.call(fab, "pointerup", () => {
+            if (dragged) {
+                const r = fab.getBoundingClientRect();
+                localStorage.setItem(POSITION_KEY, JSON.stringify({ x: r.left, y: r.top }));
+            }
+            fab.classList.remove("dragging");
+            drag = null;
+        });
+        origAdd.call(fab, "click", () => {
+            if (!dragged) toggle();
+            dragged = false;
+        });
 
         boxes.forEach((b) => origAdd.call(b, "change", () => {
             draft[b.dataset.key as Key] = b.checked;
@@ -289,10 +414,11 @@
             blocklist.value = "";
             localStorage.removeItem(STORAGE_KEY);
             localStorage.removeItem(BLOCKLIST_KEY);
+            localStorage.removeItem(POSITION_KEY);
+            fab.removeAttribute("style");
             render();
         });
         origAdd.call(reload, "click", () => location.reload());
-        origAdd.call(fab, "click", () => toggle());
         origAdd.call($(".close"), "click", () => toggle(false));
         origAdd.call(window, "keydown", (e: any) => {
             if (e.altKey && e.shiftKey && e.code === "KeyS") {
@@ -308,42 +434,28 @@
             if (!panel.hidden && !e.composedPath().includes(host)) toggle(false);
         }, true);
 
+        const dlAll = root.querySelector(".dlall") as HTMLButtonElement | null;
+        if (dlAll) origAdd.call(dlAll, "click", async () => {
+            const label = dlAll.textContent;
+            dlAll.disabled = true;
+            dlAll.textContent = t("Downloading…", "Téléchargement…");
+            const n = await downloadAll();
+            dlAll.textContent = n ? t(`✓ ${n} file(s)`, `✓ ${n} fichier(s)`) : t("No media loaded — scroll up the chat", "Aucun média chargé — remonte dans le chat");
+            setTimeout(() => { dlAll.textContent = label; dlAll.disabled = false; }, 2500);
+        });
+
         render();
-        if (settings.mediaDownload) setupDownloadButton($(".dl") as HTMLButtonElement);
+        if (settings.mediaDownload) setupDownloadButton(host, $(".dl") as HTMLButtonElement);
     }
 
-    type Media = HTMLImageElement | HTMLMediaElement;
-    const isMedia = (el: Element): el is Media => el instanceof HTMLImageElement || el instanceof HTMLMediaElement;
-
-    async function downloadMedia(m: Media) {
-        const src = m.currentSrc || m.src;
-        if (!src) return;
-        try {
-            const blob = await (await fetch(src)).blob();
-            const ext = (blob.type.split("/")[1] || "bin").split(";")[0].replace("jpeg", "jpg").replace("mpeg", "mp3");
-            const a = document.createElement("a");
-            a.href = URL.createObjectURL(blob);
-            a.download = `snapchat-${new Date().toISOString().replace(/[:.]/g, "-")}.${ext}`;
-            a.click();
-            setTimeout(() => URL.revokeObjectURL(a.href), 10_000);
-        } catch (err) {
-            // Cross-origin CDN without CORS: let the browser handle it
-            log("download failed, opening in a new tab", err);
-            window.open(src, "_blank");
-        }
-    }
-
-    function setupDownloadButton(dl: HTMLButtonElement) {
+    function setupDownloadButton(host: HTMLElement, dl: HTMLButtonElement) {
         let target: Media | null = null;
         let queued = false;
-        // elementsFromPoint sees media even under Snapchat's overlays; skip avatars/icons
-        const findMedia = (x: number, y: number) => document.elementsFromPoint(x, y).find((el): el is Media => {
-            if (!isMedia(el)) return false;
-            const r = el.getBoundingClientRect();
-            return r.width >= 80 && r.height >= 80;
-        }) ?? null;
+        // elementsFromPoint sees media even under Snapchat's overlays
+        const findMedia = (x: number, y: number) => document.elementsFromPoint(x, y).find(isDownloadable) ?? null;
 
         origAdd.call(document, "pointermove", (e: any) => {
+            if (e.composedPath().includes(host)) return; // keep the button while hovering it
             if (queued) return;
             queued = true;
             requestAnimationFrame(() => {
@@ -352,8 +464,14 @@
                 dl.hidden = !target;
                 if (!target) return;
                 const r = target.getBoundingClientRect();
-                dl.style.top = `${Math.max(r.top + 8, 8)}px`;
-                dl.style.left = `${Math.min(r.right - 44, innerWidth - 44)}px`;
+                if (target instanceof HTMLAudioElement) {
+                    // Overlapping the player would hide its controls: sit at its right edge instead
+                    dl.style.top = `${r.top + (r.height - 36) / 2}px`;
+                    dl.style.left = `${Math.min(r.right - 6, innerWidth - 44)}px`;
+                } else {
+                    dl.style.top = `${Math.max(r.top + 8, 8)}px`;
+                    dl.style.left = `${Math.min(r.right - 44, innerWidth - 44)}px`;
+                }
             });
         }, { capture: true, passive: true });
         origAdd.call(dl, "click", (e: Event) => {

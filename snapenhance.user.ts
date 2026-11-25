@@ -73,10 +73,32 @@
     const origRemove = EventTarget.prototype.removeEventListener;
 
     // ---- Upload size
+    // Only files the user picks, drops or pastes get a fake size: Snapchat's own File objects (media cache,
+    // storage) must keep their real size or reading them breaks.
+    const userFiles = new WeakSet<File>();
+    const markFiles = (proto: object, prop: string) => {
+        const desc = Object.getOwnPropertyDescriptor(proto, prop)!;
+        Object.defineProperty(proto, prop, {
+            ...desc,
+            get() {
+                const list: FileList | null = desc.get!.call(this);
+                if (list) for (const f of list) userFiles.add(f);
+                return list;
+            },
+        });
+    };
+    markFiles(HTMLInputElement.prototype, "files");
+    markFiles(DataTransfer.prototype, "files"); // drag and drop, paste
+    const getAsFile = DataTransferItem.prototype.getAsFile;
+    DataTransferItem.prototype.getAsFile = function () {
+        const f = getAsFile.call(this);
+        if (f) userFiles.add(f);
+        return f;
+    };
     const blobSize = Object.getOwnPropertyDescriptor(Blob.prototype, "size")!.get!;
     Object.defineProperty(File.prototype, "size", {
         configurable: true,
-        get() { return settings.uploadSizeBypass ? 500 : blobSize.call(this); },
+        get() { return settings.uploadSizeBypass && userFiles.has(this) ? 500 : blobSize.call(this); },
     });
 
     // ---- Main thread requests: story views, tracking, custom blocklist

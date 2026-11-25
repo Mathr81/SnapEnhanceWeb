@@ -2,7 +2,7 @@
 // @name         SnapEnhance Web
 // @namespace    snapenhance-web
 // @description  A userscript to Enhance the User experience on Snapchat Web
-// @version      1.6.0
+// @version      1.7.0
 // @author       SnapEnhance
 // @source       https://github.com/Mathr81/SnapEnhanceWeb/
 // @license      GPL-3.0-only
@@ -16,7 +16,7 @@
 // ==/UserScript==
 (function () {
     "use strict";
-    const VERSION = "1.6.0";
+    const VERSION = "1.7.0";
     const STORAGE_KEY = "snapenhance-web:settings";
     const BLOCKLIST_KEY = "snapenhance-web:blocklist";
     const POSITION_KEY = "snapenhance-web:button-position";
@@ -219,34 +219,368 @@
         return origRemove.call(this, type, wrappers.get(listener) ?? listener, options);
     };
 
+    // ---- MP4 concatenation (no re-encoding)
+    // Long video snaps arrive as ~10 s MP4 parts (ftyp+moov+mdat, H.264 + AAC, same settings). We merge their sample
+    // tables into one moov and copy every sample into one mdat. Audio is re-cut at each part boundary to the video
+    // length, otherwise the AAC padding of each part (~40 ms) piles up into an audible A/V drift.
+    // Returns null when the parts can't be merged losslessly (different codecs or settings).
+    function concatMp4(files: Uint8Array[]): Uint8Array | null {
+        type Box = { type: string; start: number; size: number; hdr: number };
+        type Sample = { file: number; off: number; size: number; dur: number; cto: number; sync: boolean };
+        type Track = { handler: string; ts: number; stsd: Uint8Array; samples: Sample[]; editStart: number; hasCtts: boolean; trak: Box };
+        const u32 = (b: Uint8Array, o: number) => ((b[o] << 24) | (b[o + 1] << 16) | (b[o + 2] << 8) | b[o + 3]) >>> 0;
+        const u64 = (b: Uint8Array, o: number) => u32(b, o) * 2 ** 32 + u32(b, o + 4);
+        const children = (b: Uint8Array, start: number, end: number) => {
+            const out: Box[] = [];
+            for (let p = start; p + 8 <= end;) {
+                let size = u32(b, p), hdr = 8;
+                const type = String.fromCharCode(b[p + 4], b[p + 5], b[p + 6], b[p + 7]);
+                if (size === 1) { size = u64(b, p + 8); hdr = 16; } else if (size === 0) size = end - p;
+                if (size < hdr || p + size > end) break;
+                out.push({ type, start: p, size, hdr });
+                p += size;
+            }
+            return out;
+        };
+        const find = (b: Uint8Array, box: Box | undefined, ...path: string[]) => path.reduce<Box | undefined>(
+            (x, t) => x && children(b, x.start + x.hdr, x.start + x.size).find((c) => c.type === t), box);
+        const body = (box: Box) => box.start + box.hdr; // first byte after the header (version/flags for full boxes)
+
+        function parseTrack(b: Uint8Array, trak: Box, file: number): Track | null {
+            const mdhd = find(b, trak, "mdia", "mdhd"), hdlr = find(b, trak, "mdia", "hdlr");
+            const stbl = find(b, trak, "mdia", "minf", "stbl");
+            if (!mdhd || !hdlr || !stbl) return null;
+            const ts = b[body(mdhd)] ? u32(b, body(mdhd) + 20) : u32(b, body(mdhd) + 12);
+            const handler = String.fromCharCode(...b.subarray(body(hdlr) + 8, body(hdlr) + 12));
+            const get = (t: string) => find(b, stbl, t);
+            const stsd = get("stsd"), stts = get("stts"), stsz = get("stsz"), stsc = get("stsc"), stco = get("stco") ?? get("co64");
+            if (!stsd || !stts || !stsz || !stsc || !stco) return null;
+            const n = u32(b, body(stsz) + 8), fixed = u32(b, body(stsz) + 4);
+            const samples: Sample[] = [];
+            for (let i = 0; i < n; i++) samples.push({ file, off: 0, size: fixed || u32(b, body(stsz) + 12 + i * 4), dur: 0, cto: 0, sync: true });
+            // decoding durations
+            let i = 0;
+            for (let e = 0, c = u32(b, body(stts) + 4); e < c; e++)
+                for (let k = u32(b, body(stts) + 8 + e * 8), d = u32(b, body(stts) + 12 + e * 8); k > 0 && i < n; k--) samples[i++].dur = d;
+            // composition offsets (signed in version 1, treat v0 the same way: real files never exceed 2^31)
+            const ctts = get("ctts");
+            if (ctts) {
+                i = 0;
+                for (let e = 0, c = u32(b, body(ctts) + 4); e < c; e++)
+                    for (let k = u32(b, body(ctts) + 8 + e * 8), o = u32(b, body(ctts) + 12 + e * 8) | 0; k > 0 && i < n; k--) samples[i++].cto = o;
+            }
+            const stss = get("stss");
+            if (stss) {
+                samples.forEach((s) => (s.sync = false));
+                for (let e = 0, c = u32(b, body(stss) + 4); e < c; e++) { const s = samples[u32(b, body(stss) + 8 + e * 4) - 1]; if (s) s.sync = true; }
+            }
+            // file offsets: chunks from stco/co64, samples per chunk from stsc
+            const is64 = stco.type === "co64", chunks = u32(b, body(stco) + 4);
+            const runs = Array.from({ length: u32(b, body(stsc) + 4) }, (_, e) => [u32(b, body(stsc) + 8 + e * 12), u32(b, body(stsc) + 12 + e * 12)]);
+            i = 0;
+            for (let ch = 1, r = 0; ch <= chunks && i < n; ch++) {
+                while (r + 1 < runs.length && runs[r + 1][0] <= ch) r++;
+                let off = is64 ? u64(b, body(stco) + 8 + (ch - 1) * 8) : u32(b, body(stco) + 8 + (ch - 1) * 4);
+                for (let k = 0; k < runs[r][1] && i < n; k++, i++) { samples[i].off = off; off += samples[i].size; }
+            }
+            // where presentation starts (edit list), in media timescale
+            let editStart = 0;
+            const elst = find(b, trak, "edts", "elst");
+            if (elst) {
+                const v = b[body(elst)], count = u32(b, body(elst) + 4), w = v ? 20 : 12;
+                for (let e = 0; e < count; e++) {
+                    const p = body(elst) + 8 + e * w, mediaTime = v ? u64(b, p + 8) : u32(b, p + 4) | 0;
+                    if (mediaTime >= 0 && mediaTime < 2 ** 53 - 1 && mediaTime !== 0xffffffff) { editStart = mediaTime; break; }
+                }
+            }
+            return { handler, ts, stsd: b.slice(stsd.start, stsd.start + stsd.size), samples, editStart, hasCtts: !!ctts, trak };
+        }
+
+        // Parse every part
+        const parts = files.map((b, file) => {
+            const top = children(b, 0, b.length), moov = top.find((x) => x.type === "moov");
+            if (!moov) return null;
+            const mvhd = find(b, moov, "mvhd")!;
+            const movieTs = b[body(mvhd)] ? u32(b, body(mvhd) + 20) : u32(b, body(mvhd) + 12);
+            const tracks = children(b, body(moov), moov.start + moov.size).filter((x) => x.type === "trak")
+                .map((trak) => parseTrack(b, trak, file));
+            const video = tracks.find((t) => t?.handler === "vide"), audio = tracks.find((t) => t?.handler === "soun");
+            return video ? { moov, movieTs, video, audio, ftyp: top.find((x) => x.type === "ftyp") } : null;
+        });
+        if (parts.some((p) => !p)) return null;
+        const first = parts[0]!;
+        // Codec settings must match; bitrate fields legitimately differ per part, so they're blanked before comparing
+        const codecKey = (stsd: Uint8Array) => {
+            const k = stsd.slice(), text = new TextDecoder("latin1").decode(k);
+            const btrt = text.indexOf("btrt");
+            if (btrt > 0) k.fill(0, btrt + 4, btrt + 16);
+            const esds = text.indexOf("esds");
+            for (let i = esds; esds > 0 && i < k.length; i++) {
+                if (k[i] !== 0x04) continue; // DecoderConfigDescriptor tag, then a 1-4 byte length
+                let j = i + 1;
+                while (j < i + 5 && k[j] & 0x80) j++;
+                if (k[j + 1] === 0x40) { k.fill(0, j + 3, j + 14); break; } // AAC: blank buffer size, max and avg bitrate
+            }
+            return k;
+        };
+        const same = (a: Uint8Array, b: Uint8Array) => {
+            const x = codecKey(a), y = codecKey(b);
+            return x.length === y.length && x.every((v, i) => v === y[i]);
+        };
+        for (const p of parts) {
+            if (p!.video.ts !== first.video.ts || !same(p!.video.stsd, first.video.stsd)) return null;
+            if (!!p!.audio !== !!first.audio) return null;
+            if (p!.audio && (p!.audio.ts !== first.audio!.ts || !same(p!.audio.stsd, first.audio!.stsd))) return null;
+        }
+
+        // Merge samples: all video; audio after its priming (edit start), cut to the cumulated video length
+        const video: Sample[] = [], audio: Sample[] = [];
+        let videoEnd = 0, audioEnd = 0; // seconds
+        for (const p of parts as NonNullable<(typeof parts)[number]>[]) {
+            video.push(...p.video.samples);
+            videoEnd += p.video.samples.reduce((s, x) => s + x.dur, 0) / p.video.ts;
+            if (!p.audio) continue;
+            let t = 0;
+            for (const s of p.audio.samples) {
+                const start = t;
+                t += s.dur;
+                if (start + s.dur <= p.audio.editStart) continue; // encoder priming
+                if (audioEnd + s.dur / p.audio.ts / 2 > videoEnd) break; // keep A/V aligned at the cut
+                audio.push(s);
+                audioEnd += s.dur / p.audio.ts;
+            }
+        }
+
+        // Writers
+        const cat = (...parts: Uint8Array[]) => {
+            const out = new Uint8Array(parts.reduce((s, p) => s + p.length, 0));
+            let o = 0;
+            for (const p of parts) { out.set(p, o); o += p.length; }
+            return out;
+        };
+        const be = (...ns: number[]) => {
+            const out = new Uint8Array(ns.length * 4);
+            ns.forEach((n, i) => new DataView(out.buffer).setUint32(i * 4, n >>> 0));
+            return out;
+        };
+        const box = (type: string, ...parts: Uint8Array[]) => {
+            const content = cat(...parts);
+            return cat(be(content.length + 8), new TextEncoder().encode(type), content);
+        };
+        const full = (type: string, version: number, ...parts: Uint8Array[]) => box(type, be(version << 24), ...parts);
+        const rle = (values: number[]) => {
+            const out: number[][] = [];
+            for (const v of values) { const last = out[out.length - 1]; if (last && last[1] === v) last[0]++; else out.push([1, v]); }
+            return out;
+        };
+        const firstBuf = files[0];
+        const copy = (b: Box) => firstBuf.slice(b.start, b.start + b.size);
+
+        // Sample tables: one sample per chunk keeps stco trivial; offsets are patched once mdat's position is known
+        const stbl = (t: Track, samples: Sample[], offsets: number[]) => {
+            const durations = rle(samples.map((s) => s.dur));
+            const parts = [t.stsd, full("stts", 0, be(durations.length, ...durations.flat()))];
+            if (t.hasCtts) {
+                const r = rle(samples.map((s) => s.cto));
+                parts.push(full("ctts", r.some(([, v]) => v < 0) ? 1 : 0, be(r.length, ...r.flat())));
+            }
+            if (samples.some((s) => !s.sync)) {
+                const sync = samples.flatMap((s, i) => (s.sync ? [i + 1] : []));
+                parts.push(full("stss", 0, be(sync.length, ...sync)));
+            }
+            parts.push(full("stsz", 0, be(0, samples.length, ...samples.map((s) => s.size))));
+            parts.push(full("stsc", 0, be(1, 1, 1, 1)));
+            parts.push(full("stco", 0, be(samples.length, ...offsets)));
+            return box("stbl", ...parts);
+        };
+        const mediaDur = (samples: Sample[]) => samples.reduce((s, x) => s + x.dur, 0);
+        // Copy a mvhd/mdhd/tkhd box with a new duration. Field position after the header, version 0 / 1:
+        // mvhd, mdhd: flags, 2 dates, timescale → 16 / 24. tkhd: flags, 2 dates, track id, reserved → 20 / 28.
+        const withDuration = (b: Box, dur: number) => {
+            const out = copy(b), v = out[b.hdr];
+            const p = b.hdr + (b.type === "tkhd" ? (v ? 28 : 20) : (v ? 24 : 16));
+            const dv = new DataView(out.buffer);
+            if (v) { dv.setUint32(p, Math.floor(dur / 2 ** 32)); dv.setUint32(p + 4, dur >>> 0); } else dv.setUint32(p, dur);
+            return out;
+        };
+
+        function trak(t: Track, samples: Sample[], offsets: number[], movieTs: number) {
+            const b = firstBuf, dur = mediaDur(samples), movieDur = Math.round((dur * movieTs) / t.ts);
+            const kids = children(b, body(t.trak), t.trak.start + t.trak.size);
+            return box("trak", ...kids.flatMap((k) => {
+                if (k.type === "tkhd") return [withDuration(k, movieDur)];
+                if (k.type === "edts") {
+                    if (t.handler !== "vide" || !t.editStart) return []; // audio priming already cut out
+                    const shown = Math.max(0, movieDur - Math.round((t.editStart * movieTs) / t.ts));
+                    return [box("edts", full("elst", 0, be(1, shown, t.editStart, 0x10000)))];
+                }
+                if (k.type !== "mdia") return [copy(k)];
+                return [box("mdia", ...children(b, body(k), k.start + k.size).map((m) => {
+                    if (m.type === "mdhd") return withDuration(m, dur);
+                    if (m.type !== "minf") return copy(m);
+                    return box("minf", ...children(b, body(m), m.start + m.size).map((s) => (s.type === "stbl" ? stbl(t, samples, offsets) : copy(s))));
+                }))];
+            }));
+        }
+
+        function moov(offsets: { v: number[]; a: number[] }) {
+            const b = firstBuf, movieTs = first.movieTs;
+            const vDur = Math.round((mediaDur(video) * movieTs) / first.video.ts);
+            const aDur = first.audio ? Math.round((mediaDur(audio) * movieTs) / first.audio.ts) : 0;
+            return box("moov", ...children(b, body(first.moov), first.moov.start + first.moov.size).flatMap((k) => {
+                if (k.type === "mvhd") return [withDuration(k, Math.max(vDur, aDur))];
+                if (k.type !== "trak") return [copy(k)];
+                if (k.start === first.video.trak.start) return [trak(first.video, video, offsets.v, movieTs)];
+                if (first.audio && k.start === first.audio.trak.start) return [trak(first.audio, audio, offsets.a, movieTs)];
+                return [];
+            }));
+        }
+
+        // Layout: ftyp, moov, mdat(video then audio). moov's size doesn't depend on offset values.
+        const ftyp = first.ftyp ? copy(first.ftyp) : new Uint8Array();
+        const zeros = { v: video.map(() => 0), a: audio.map(() => 0) };
+        let pos = ftyp.length + moov(zeros).length + 8;
+        const place = (list: Sample[]) => list.map((s) => { const o = pos; pos += s.size; return o; });
+        const offsets = { v: place(video), a: place(audio) };
+        if (pos > 0xffffffff) return null; // would need co64 / 64-bit mdat; not happening for snaps
+        const payload = cat(...[...video, ...audio].map((s) => files[s.file].subarray(s.off, s.off + s.size)));
+        return cat(ftyp, moov(offsets), be(payload.length + 8), new TextEncoder().encode("mdat"), payload);
+    }
+
     // ---- Media helpers
     type Media = HTMLImageElement | HTMLMediaElement;
     const BITMOJI = /bitmoji\.com|sc-cdn\.net\/3d\//;
     const mediaSrc = (m: Media) => m.currentSrc || m.src || m.querySelector("source")?.src || "";
+    // Chat thumbnails are a [role=button] box whose <video> stays 0 px wide until played: measure the box
+    const boxOf = (m: Element) => (m.closest("[role=button]") ?? m).getBoundingClientRect();
     function isDownloadable(el: Element): el is Media {
         if (!(el instanceof HTMLImageElement || el instanceof HTMLMediaElement)) return false;
         const src = mediaSrc(el);
         if (!src || BITMOJI.test(src)) return false;
-        const r = el.getBoundingClientRect();
+        const r = boxOf(el);
         return el instanceof HTMLAudioElement ? r.width > 0 : r.width >= 80 && r.height >= 80;
     }
+
+    const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+    // Snapchat revokes a snap's blob: URL once it's closed: keep the blobs it creates so they stay downloadable
+    const knownBlobs = new Map<string, Blob>();
+    const origCreateObjectURL = URL.createObjectURL;
+    URL.createObjectURL = function (obj: any) {
+        const url = origCreateObjectURL.call(URL, obj);
+        if (obj instanceof Blob && /^(video|audio|image)\//.test(obj.type)) {
+            knownBlobs.set(url, obj);
+            if (knownBlobs.size > 300) knownBlobs.delete(knownBlobs.keys().next().value!);
+        }
+        return url;
+    };
+    const blobOf = async (src: string) => knownBlobs.get(src) ?? (await (await fetch(src)).blob());
+
+    function saveBlob(blob: Blob, ext: string, suffix = "") {
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(blob);
+        a.download = `snapchat-${new Date().toISOString().replace(/[:.]/g, "-")}${suffix}.${ext}`;
+        a.click();
+        setTimeout(() => URL.revokeObjectURL(a.href), 10_000);
+    }
+    const extOf = (blob: Blob, m?: Media) => {
+        const ext = (blob.type.split("/")[1] || "bin").split(";")[0].replace("jpeg", "jpg").replace("mpeg", "mp3");
+        return m instanceof HTMLAudioElement && ext === "mp4" ? "m4a" : ext; // voice notes are AAC in an mp4 container
+    };
 
     async function downloadMedia(m: Media) {
         const src = mediaSrc(m);
         if (!src) return;
         try {
-            const blob = await (await fetch(src)).blob();
-            let ext = (blob.type.split("/")[1] || "bin").split(";")[0].replace("jpeg", "jpg").replace("mpeg", "mp3");
-            if (m instanceof HTMLAudioElement && ext === "mp4") ext = "m4a"; // voice notes are AAC in an mp4 container
-            const a = document.createElement("a");
-            a.href = URL.createObjectURL(blob);
-            a.download = `snapchat-${new Date().toISOString().replace(/[:.]/g, "-")}.${ext}`;
-            a.click();
-            setTimeout(() => URL.revokeObjectURL(a.href), 10_000);
+            const blob = await blobOf(src);
+            saveBlob(blob, extOf(blob, m));
         } catch (err) {
             // Cross-origin CDN without CORS: let the browser handle it
             log("download failed, opening in a new tab", err);
             window.open(src, "_blank");
+        }
+    }
+
+    // ---- Long video snaps (several ~10 s parts) → one file
+    // In a conversation, parts are consecutive media items of one message group; off-screen ones are empty
+    // 9:16 boxes until scrolled into view. In the snap viewer, parts play one after another outside the list.
+    const isSlot = (el: Element | null): el is HTMLLIElement => el instanceof HTMLLIElement && !!el.querySelector('[style*="aspect-ratio"]');
+    const slotVideo = (li: Element) => li.querySelector<HTMLVideoElement>("[role=button] video");
+    const slotLoaded = (li: Element) => !!li.querySelector("[role=button] img, [role=button] video");
+    const adjacentSlots = (li: HTMLLIElement) => {
+        const run = [li];
+        for (let p = li.previousElementSibling; isSlot(p); p = p.previousElementSibling) run.unshift(p);
+        for (let n = li.nextElementSibling; isSlot(n); n = n.nextElementSibling) run.push(n);
+        return run;
+    };
+    const scrollParent = (el: Element) => {
+        for (let p = el.parentElement; p; p = p.parentElement) if (/auto|scroll/.test(getComputedStyle(p).overflowY)) return p;
+        return null;
+    };
+    // Rough count shown on the button, before anything is loaded
+    const partCount = (li: HTMLLIElement) => adjacentSlots(li).filter((s) => slotVideo(s) || !slotLoaded(s)).length;
+
+    // Thumbnail blob: URLs come from Snapchat's worker and are revoked once scrolled away, so each part's
+    // content is read as soon as it's loaded.
+    async function chatVideoParts(li: HTMLLIElement): Promise<Blob[]> {
+        const slots = adjacentSlots(li), scroller = scrollParent(li), top = scroller?.scrollTop ?? 0;
+        const ready = (s: Element) => slotLoaded(s) && (!slotVideo(s) || !!mediaSrc(slotVideo(s)!));
+        const found: (Blob | null)[] = [];
+        for (const s of slots) {
+            if (!ready(s)) {
+                s.scrollIntoView({ block: "center" });
+                for (let i = 0; i < 40 && !ready(s); i++) await sleep(100);
+            }
+            const v = slotVideo(s);
+            found.push(v ? await blobOf(mediaSrc(v)).catch(() => null) : null);
+        }
+        if (scroller) scroller.scrollTop = top;
+        // the run of videos around the hovered one (a photo sent in between ends it)
+        let a = slots.indexOf(li), b = a;
+        while (a > 0 && found[a - 1]) a--;
+        while (b < found.length - 1 && found[b + 1]) b++;
+        return found.slice(a, b + 1).filter((x): x is Blob => !!x);
+    }
+
+    // Snap viewer: remember the parts it plays (read right away, before Snapchat revokes them),
+    // and which chat thumbnail opened it (saved snaps play one part on loop)
+    let viewerParts: { src: string; blob: Promise<Blob | null> }[] = [], viewerSeen = 0;
+    let lastThumb: { li: HTMLLIElement; at: number } | null = null, viewerThumb: HTMLLIElement | null = null;
+    origAdd.call(document, "click", (e: Event) => {
+        const li = (e.target as Element).closest?.("li");
+        if (isSlot(li) && slotVideo(li)) lastThumb = { li, at: Date.now() };
+    }, true);
+    const trackViewer = (e: Event) => {
+        const v = e.target;
+        if (!(v instanceof HTMLVideoElement) || v.closest("li")) return;
+        if (Date.now() - viewerSeen > 15_000) { // a new viewer session
+            viewerParts = [];
+            viewerThumb = lastThumb && Date.now() - lastThumb.at < 5000 ? lastThumb.li : null;
+        }
+        viewerSeen = Date.now();
+        const src = mediaSrc(v);
+        if (e.type === "loadeddata" && src && !viewerParts.some((p) => p.src === src))
+            viewerParts.push({ src, blob: blobOf(src).catch(() => null) });
+    };
+    origAdd.call(document, "loadeddata", trackViewer, true); // media events don't bubble: capture
+    origAdd.call(document, "timeupdate", trackViewer, true);
+
+    const videoPartCount = (v: HTMLVideoElement) => {
+        const li = v.closest("li");
+        if (isSlot(li)) return partCount(li);
+        return viewerThumb?.isConnected ? partCount(viewerThumb) : viewerParts.length;
+    };
+    async function downloadVideo(v: HTMLVideoElement) {
+        const li = v.closest("li");
+        const blobs = isSlot(li) ? await chatVideoParts(li)
+            : viewerThumb?.isConnected ? await chatVideoParts(viewerThumb)
+            : (await Promise.all(viewerParts.map((p) => p.blob))).filter((x): x is Blob => !!x);
+        if (blobs.length < 2) return downloadMedia(v);
+        const merged = concatMp4(await Promise.all(blobs.map(async (b) => new Uint8Array(await b.arrayBuffer()))));
+        if (merged) return saveBlob(new Blob([merged as BlobPart], { type: "video/mp4" }), "mp4");
+        log("video parts use different settings, saving them separately");
+        for (const [i, b] of blobs.entries()) {
+            saveBlob(b, extOf(b), `-part${i + 1}`);
+            await sleep(300);
         }
     }
 
@@ -267,6 +601,7 @@
     function setupDeletedKeeper() {
         type Removed = { node: HTMLLIElement; parent: Node; next: Node | null; path: string };
         const pending: Removed[] = [];
+        const added = new WeakSet<Node>();
         let timer = 0;
         const fingerprint = (n: Element) => (n.textContent || "").trim()
             + [...n.querySelectorAll("img, video, audio, source")].map((m: any) => m.currentSrc || m.src || "").join("|");
@@ -275,6 +610,7 @@
         new MutationObserver((records) => {
             if (!settings.keepDeleted || !isConversation()) return;
             for (const r of records) {
+                r.addedNodes.forEach((n) => n instanceof HTMLLIElement && added.add(n));
                 for (const n of r.removedNodes) {
                     if (!(n instanceof HTMLLIElement) || "seGhost" in n.dataset) continue;
                     const parent = r.target as Element;
@@ -295,6 +631,10 @@
             const onScreen = new Set([...document.querySelectorAll("li")].map(fingerprint));
             for (const p of removed) {
                 if (location.pathname !== p.path || !p.parent.isConnected) continue;
+                // A new <li> in the same slot is a re-render (e.g. "Loading media…" placeholder → thumbnail)
+                const next = p.next && p.next.parentNode === p.parent ? p.next : null;
+                const inSlot = next ? next.previousSibling : p.parent.lastChild;
+                if (inSlot && added.has(inSlot)) continue;
                 const fp = fingerprint(p.node);
                 if (onScreen.has(fp) || [...onScreen].some((s) => s.includes(fp))) continue; // moved, not deleted
                 const ghost = p.node.cloneNode(true) as HTMLLIElement;
@@ -304,7 +644,7 @@
                 badge.textContent = t("🗑 Deleted", "🗑 Supprimé");
                 badge.style.cssText = "color:#e5484d;font:600 11px system-ui,sans-serif;margin:2px 0 0 8px";
                 ghost.prepend(badge);
-                p.parent.insertBefore(ghost, p.next && p.next.parentNode === p.parent ? p.next : null);
+                p.parent.insertBefore(ghost, next);
                 log("kept deleted message", fp.slice(0, 60));
             }
         }
@@ -380,6 +720,12 @@
             background: rgba(0,0,0,.65); color: #fff; box-shadow: 0 2px 8px rgba(0,0,0,.4);
         }
         .dl:hover { background: #FFFC00; color: #111; }
+        .dl[data-count]::after {
+            content: attr(data-count); position: absolute; top: -6px; right: -8px; padding: 1px 5px; border-radius: 8px;
+            background: #FFFC00; color: #111; font: 700 10px system-ui, sans-serif;
+        }
+        .dl.busy { opacity: .6; cursor: progress; animation: se-pulse 1s ease-in-out infinite; }
+        @keyframes se-pulse { 50% { transform: scale(.9); } }
         .dl[hidden] { display: none; }
         @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
     `;
@@ -526,7 +872,13 @@
         let target: Media | null = null;
         let queued = false;
         // elementsFromPoint sees media even under Snapchat's overlays
-        const findMedia = (x: number, y: number) => document.elementsFromPoint(x, y).find(isDownloadable) ?? null;
+        const findMedia = (x: number, y: number) => {
+            for (const el of document.elementsFromPoint(x, y)) {
+                const m = el.matches("[role=button]") ? el.querySelector("video, img") : el;
+                if (m && isDownloadable(m)) return m;
+            }
+            return null;
+        };
 
         origAdd.call(document, "pointermove", (e: any) => {
             if (e.composedPath().includes(host)) return; // keep the button while hovering it
@@ -537,7 +889,11 @@
                 target = settings.mediaDownload ? findMedia(e.clientX, e.clientY) : null;
                 dl.hidden = !target;
                 if (!target) return;
-                const r = target.getBoundingClientRect();
+                const parts = target instanceof HTMLVideoElement ? videoPartCount(target) : 1;
+                if (parts > 1) dl.dataset.count = `×${parts}`;
+                else delete dl.dataset.count;
+                dl.title = parts > 1 ? t(`Download the full video (${parts} parts)`, `Télécharger la vidéo entière (${parts} parties)`) : t("Download", "Télécharger");
+                const r = boxOf(target);
                 if (target instanceof HTMLAudioElement) {
                     // Overlapping the player would hide its controls: sit at its right edge instead
                     dl.style.top = `${r.top + (r.height - 36) / 2}px`;
@@ -548,9 +904,15 @@
                 }
             });
         }, { capture: true, passive: true });
-        origAdd.call(dl, "click", (e: Event) => {
+        origAdd.call(dl, "click", async (e: Event) => {
             e.stopPropagation();
-            if (target) downloadMedia(target);
+            if (!target || dl.classList.contains("busy")) return;
+            dl.classList.add("busy");
+            try {
+                await (target instanceof HTMLVideoElement ? downloadVideo(target) : downloadMedia(target));
+            } finally {
+                dl.classList.remove("busy");
+            }
         });
     }
 

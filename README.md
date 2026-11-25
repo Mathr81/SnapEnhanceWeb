@@ -3,14 +3,14 @@ The web version of SnapEnhance
 
 ## Features
 - [x] Bypass upload size
-- [x] Download any media: button on hover, or right click context menu
-- [x] Bypass screenshot detection
-- [x] Remove blur when unfocused
+- [x] Download any media (images, videos, stories, voice notes): button on hover, or "download all" for the open chat
+- [x] Bypass screenshot detection (PrintScreen, Win/Cmd+Shift, Ctrl+Shift, right-click)
+- [x] Remove blur / away state when unfocused
 - [x] Disable conversation read receipts
 - [x] Disable story read receipts
-- [x] Hide bitmoji in chat
-- [x] Remove typing notification
-- [x] Settings panel: every feature can be toggled on/off
+- [x] Hide bitmoji and typing indicator (blocks presence messages only)
+- [x] Block Snapchat tracking (analytics, error reports)
+- [x] Settings panel in English or French, draggable button
 - [x] Custom blocked requests, to fix a feature after a Snapchat update without recompiling
 
 ## Install

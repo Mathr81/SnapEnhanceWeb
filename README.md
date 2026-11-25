@@ -9,6 +9,8 @@ The web version of SnapEnhance
 - [x] Disable conversation read receipts
 - [x] Disable story read receipts
 - [x] Open snaps anonymously (they stay unopened for the sender; also blocks saving/reacting/deleting from the web)
+- [x] Keep deleted messages: messages deleted while the chat is open stay visible, greyed out
+- [x] Settings apply instantly, no reload needed
 - [x] Hide bitmoji and typing indicator (blocks presence messages only)
 - [x] Block Snapchat tracking (analytics, error reports)
 - [x] Settings panel in English or French, draggable button
@@ -22,7 +24,7 @@ The web version of SnapEnhance
 
 ## Settings
 Click the 👻 button in the bottom-left corner of Snapchat Web, or press **Alt+Shift+S**.
-Settings are saved in your browser; reload the page to apply them.
+Settings are saved in your browser and apply instantly.
 
 If screenshot detection still triggers, enable **Strict screenshot mode** (it also blocks Snapchat's keyboard shortcuts, such as Enter to send).
 

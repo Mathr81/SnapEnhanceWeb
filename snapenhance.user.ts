@@ -2,7 +2,7 @@
 // @name         SnapEnhance Web
 // @namespace    snapenhance-web
 // @description  A userscript to Enhance the User experience on Snapchat Web
-// @version      1.5.0
+// @version      1.6.0
 // @author       SnapEnhance
 // @source       https://github.com/Mathr81/SnapEnhanceWeb/
 // @license      GPL-3.0-only
@@ -16,10 +16,11 @@
 // ==/UserScript==
 (function () {
     "use strict";
-    const VERSION = "1.5.0";
+    const VERSION = "1.6.0";
     const STORAGE_KEY = "snapenhance-web:settings";
     const BLOCKLIST_KEY = "snapenhance-web:blocklist";
     const POSITION_KEY = "snapenhance-web:button-position";
+    const CHANNEL = "snapenhance-web";
 
     const FR = /^fr\b/i.test(navigator.language);
     const t = (en: string, fr: string) => (FR ? fr : en);
@@ -30,6 +31,7 @@
         storyReadReceipts: [t("Hide story views", "Vues de story invisibles"), t("Watch stories without showing up in viewers", "Regarder les stories sans apparaître dans les vues"), true],
         chatReadReceipts: [t("Hide chat read receipts", "Pas d'accusé de lecture"), t("Read messages without marking them as seen", "Lire les messages sans qu'ils passent en « Vu »"), true],
         snapReadReceipts: [t("Open snaps anonymously", "Ouvrir les snaps en anonyme"), t("Red/purple snaps stay unopened for the sender. Also blocks saving, reacting and deleting messages", "Les snaps rouges/violets restent « non ouverts » chez l'envoyeur. Bloque aussi enregistrer, réagir et supprimer un message"), true],
+        keepDeleted: [t("Keep deleted messages", "Garder les messages supprimés"), t("Messages deleted while the chat is open stay visible, greyed out", "Les messages supprimés pendant que le chat est ouvert restent affichés, grisés"), true],
         hideBitmoji: [t("Hide bitmoji & typing", "Cacher bitmoji et « écrit… »"), t("Friends don't see you in the chat or typing (blocks presence messages)", "Tes amis ne te voient pas dans le chat ni en train d'écrire"), true],
         screenshotBypass: [t("Bypass screenshot detection", "Captures d'écran non détectées"), t("PrintScreen, Win/Cmd+Shift, Ctrl+Shift and right-click no longer trigger it", "Impr. écran, Win/Cmd+Maj, Ctrl+Maj et clic droit ne déclenchent plus rien"), true],
         alwaysFocused: [t("Stay focused", "Toujours actif"), t("No blur or away state when you switch windows", "Pas de flou ni d'état « absent » quand tu changes de fenêtre"), true],
@@ -39,6 +41,7 @@
     } as const;
     type Key = keyof typeof FEATURES;
     type Settings = Record<Key, boolean>;
+    type Shared = { settings: Settings; customBlocked: string[] };
 
     const DEFAULTS = Object.fromEntries(Object.entries(FEATURES).map(([k, f]) => [k, f[2]])) as Settings;
     function loadSettings(): Settings {
@@ -48,10 +51,19 @@
             return { ...DEFAULTS };
         }
     }
+    const parseBlocklist = (text: string) => text.split("\n").map((s) => s.trim()).filter(Boolean);
+    // Settings are read at call time everywhere, so changes apply without reloading
     const settings = loadSettings();
-    // User-defined URL fragments to block (one per line), to repair features without recompiling
-    const savedBlocklist = localStorage.getItem(BLOCKLIST_KEY) || "";
-    const customBlocked = savedBlocklist.split("\n").map((s) => s.trim()).filter(Boolean);
+    let customBlocked = parseBlocklist(localStorage.getItem(BLOCKLIST_KEY) || "");
+    const channel = new BroadcastChannel(CHANNEL); // reaches Snapchat's worker (same origin)
+    function saveAndBroadcast(next: Settings, blocklistText: string) {
+        Object.assign(settings, next);
+        customBlocked = parseBlocklist(blocklistText);
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
+        localStorage.setItem(BLOCKLIST_KEY, blocklistText);
+        channel.postMessage({ settings, customBlocked } satisfies Shared);
+    }
+
     const log = (...a: any[]) => settings.debug && console.log("[SnapEnhance]", ...a);
     const urlOf = (input: any): string =>
         typeof input === "string" ? input : input instanceof URL ? input.href : input?.url ?? "";
@@ -61,68 +73,81 @@
     const origRemove = EventTarget.prototype.removeEventListener;
 
     // ---- Upload size
-    if (settings.uploadSizeBypass) {
-        Object.defineProperty(File.prototype, "size", { get: () => 500 });
-    }
+    const blobSize = Object.getOwnPropertyDescriptor(Blob.prototype, "size")!.get!;
+    Object.defineProperty(File.prototype, "size", {
+        configurable: true,
+        get() { return settings.uploadSizeBypass ? 500 : blobSize.call(this); },
+    });
 
     // ---- Main thread requests: story views, tracking, custom blocklist
     const TRACKING = ["web-blizzard/web/send", "/graphene/web", "sentry.sc-prod.net", "/web/metrics"];
-    const mainBlocked = [...customBlocked];
-    if (settings.storyReadReceipts) mainBlocked.push("readreceipt-indexer/batchuploadreadreceipts");
-    if (settings.blockTracking) mainBlocked.push(...TRACKING);
-    const isBlocked = (url: string) => mainBlocked.some((b) => url.includes(b));
-    if (mainBlocked.length) {
-        const origFetch = window.fetch;
-        window.fetch = function (...args: any[]) {
-            const url = urlOf(args[0]);
-            if (isBlocked(url)) {
-                log("blocked", url);
-                return Promise.resolve(new Response(null, { status: 200 }));
-            }
-            return origFetch.apply(window, args as any);
-        };
-        const origBeacon = navigator.sendBeacon;
-        navigator.sendBeacon = function (url: any, data?: any) {
-            if (isBlocked(urlOf(url))) return log("blocked beacon", url), true;
-            return origBeacon.call(navigator, url, data);
-        };
-    }
-
-    // ---- Worker hooks (chat read receipts, presence/typing). Runs inside the worker: must be self-contained.
-    function workerInjected(s: Settings, extra: string[], tracking: string[]) {
-        const wlog = (...a: any[]) => s.debug && console.log("[SnapEnhance worker]", ...a);
-        const blocked = [...extra];
-        if (s.chatReadReceipts) blocked.push("messagingcoreservice.MessagingCoreService/UpdateConversation");
-        if (s.hideBitmoji) blocked.push("messagingcoreservice.MessagingCoreService/SendTypingNotification");
-        // Per-message state (viewed, replayed, saved, reacted...): no way to tell actions apart without decoding protobuf
-        if (s.snapReadReceipts) blocked.push("MessagingCoreService/UpdateContentMessage", "MessagingCoreService/BatchUpdateContentMessages");
-        if (s.blockTracking) blocked.push(...tracking);
-
-        if (s.hideBitmoji) {
-            // Presence ("in chat", typing, screenshot flag) travels over the websocket as "...presence..." messages
-            const decoder = new TextDecoder("latin1");
-            const isPresence = (d: any) => {
-                try {
-                    return (typeof d === "string" ? d : decoder.decode(d)).includes("presence");
-                } catch {
-                    return false;
-                }
-            };
-            const origSend = WebSocket.prototype.send;
-            WebSocket.prototype.send = function (data: any) {
-                if (isPresence(data)) return wlog("blocked presence");
-                return origSend.call(this, data);
-            };
+    const isBlocked = (url: string) => [
+        ...customBlocked,
+        ...(settings.storyReadReceipts ? ["readreceipt-indexer/batchuploadreadreceipts"] : []),
+        ...(settings.blockTracking ? TRACKING : []),
+    ].some((b) => url.includes(b));
+    const origFetch = window.fetch;
+    window.fetch = function (...args: any[]) {
+        const url = urlOf(args[0]);
+        if (isBlocked(url)) {
+            log("blocked", url);
+            return Promise.resolve(new Response(null, { status: 200 }));
         }
+        return origFetch.apply(window, args as any);
+    };
+    const origBeacon = navigator.sendBeacon;
+    navigator.sendBeacon = function (url: any, data?: any) {
+        if (isBlocked(urlOf(url))) return log("blocked beacon", url), true;
+        return origBeacon.call(navigator, url, data);
+    };
 
-        const origFetch = self.fetch;
+    // ---- Worker hooks (read receipts, snaps, presence/typing). Runs inside the worker: must be self-contained.
+    function workerInjected(init: Shared, tracking: string[]) {
+        let { settings: s, customBlocked: extra } = init;
+        new BroadcastChannel("snapenhance-web").onmessage = (e: MessageEvent) => ({ settings: s, customBlocked: extra } = e.data);
+        const wlog = (...a: any[]) => s.debug && console.log("[SnapEnhance worker]", ...a);
+        // Per-message state (viewed, replayed, saved, reacted...). The action is encrypted, so all of it is blocked.
+        const MESSAGE_UPDATES = ["MessagingCoreService/UpdateContentMessage", "MessagingCoreService/BatchUpdateContentMessages"];
+        // Snapchat retries a failed update until it succeeds: once one is held back, keep holding them until reload
+        // so turning the option off can't leak an "opened" retry.
+        let heldUpdates = false;
+        const blockedList = () => [
+            ...extra,
+            ...(s.chatReadReceipts ? ["messagingcoreservice.MessagingCoreService/UpdateConversation"] : []),
+            ...(s.hideBitmoji ? ["messagingcoreservice.MessagingCoreService/SendTypingNotification"] : []),
+            ...(s.snapReadReceipts || heldUpdates ? MESSAGE_UPDATES : []),
+            ...(s.blockTracking ? tracking : []),
+        ];
+
+        // Presence ("in chat", typing, screenshot flag) travels over the websocket as "...presence..." messages
+        const decoder = new TextDecoder("latin1");
+        const isPresence = (d: any) => {
+            try {
+                return (typeof d === "string" ? d : decoder.decode(d)).includes("presence");
+            } catch {
+                return false;
+            }
+        };
+        const origSend = WebSocket.prototype.send;
+        WebSocket.prototype.send = function (data: any) {
+            if (s.hideBitmoji && isPresence(data)) return wlog("blocked presence");
+            return origSend.call(this, data);
+        };
+
+        const origWorkerFetch = self.fetch;
         self.fetch = function (...args: any[]) {
             const url = urlOf(args[0]);
-            if (blocked.some((b) => url.includes(b))) {
+            if (blockedList().some((b) => url.includes(b))) {
                 wlog("blocked", url);
+                if (MESSAGE_UPDATES.some((b) => url.includes(b))) {
+                    // A fake 200 stalls Snapchat's request queue (no conversation loads any more);
+                    // a network error is retried in the background instead.
+                    heldUpdates = true;
+                    return Promise.reject(new TypeError("Failed to fetch"));
+                }
                 return Promise.resolve(new Response(null, { status: 200 }));
             }
-            return origFetch.apply(self, args as any);
+            return origWorkerFetch.apply(self, args as any);
         };
     }
 
@@ -131,7 +156,7 @@
         constructor(parts?: any[], options?: BlobPropertyBag) {
             if (typeof parts?.[0] === "string" && parts[0].startsWith("importScripts")) {
                 parts = [...parts];
-                const args = [settings, customBlocked, TRACKING].map((a) => JSON.stringify(a)).join(",");
+                const args = [{ settings, customBlocked }, TRACKING].map((a) => JSON.stringify(a)).join(",");
                 parts[0] += `;\nconst urlOf=${urlOf};(${workerInjected})(${args});\n`;
                 window.Blob = OrigBlob;
             }
@@ -140,52 +165,58 @@
     } as typeof Blob;
 
     // ---- Media download
-    if (settings.mediaDownload) {
-        const origSetAttribute = Element.prototype.setAttribute;
-        HTMLMediaElement.prototype.setAttribute = function (name: string, value: string) {
-            if (name.toLowerCase() === "controlslist") return;
-            return origSetAttribute.call(this, name, value);
-        };
-        // Capture on window runs before Snapchat's handlers; we stop them but keep the native menu
-        origAdd.call(window, "contextmenu", (e: any) => {
-            const hit = document.elementsFromPoint(e.clientX, e.clientY)
-                .some((el) => el instanceof HTMLImageElement || el instanceof HTMLMediaElement);
-            if (hit) e.stopImmediatePropagation();
-        }, true);
-    }
+    const origSetAttribute = Element.prototype.setAttribute;
+    HTMLMediaElement.prototype.setAttribute = function (name: string, value: string) {
+        if (settings.mediaDownload && name.toLowerCase() === "controlslist") return;
+        return origSetAttribute.call(this, name, value);
+    };
+    // Capture on window runs before Snapchat's handlers; we stop them but keep the native menu
+    origAdd.call(window, "contextmenu", (e: any) => {
+        if (!settings.mediaDownload) return;
+        const hit = document.elementsFromPoint(e.clientX, e.clientY)
+            .some((el) => el instanceof HTMLImageElement || el instanceof HTMLMediaElement);
+        if (hit) e.stopImmediatePropagation();
+    }, true);
 
     // ---- Focus / screenshot
-    if (settings.alwaysFocused) {
-        document.hasFocus = () => true;
-        Object.defineProperty(document, "hidden", { get: () => false });
-        Object.defineProperty(document, "visibilityState", { get: () => "visible" });
-    }
+    const origHasFocus = Document.prototype.hasFocus;
+    const docHidden = Object.getOwnPropertyDescriptor(Document.prototype, "hidden")!.get!;
+    const docVisibility = Object.getOwnPropertyDescriptor(Document.prototype, "visibilityState")!.get!;
+    document.hasFocus = function () { return settings.alwaysFocused || origHasFocus.call(this); };
+    Object.defineProperty(document, "hidden", { get() { return settings.alwaysFocused ? false : docHidden.call(this); } });
+    Object.defineProperty(document, "visibilityState", { get() { return settings.alwaysFocused ? "visible" : docVisibility.call(this); } });
 
     // Mirrors Snapchat's detector: PrintScreen, or Shift with Ctrl/Meta held (Win+Shift+S, Cmd+Shift+4...)
     const isScreenshotKey = (e: KeyboardEvent) => e.key === "PrintScreen" || (e.shiftKey && (e.metaKey || e.ctrlKey));
-    const keyWrappers = new WeakMap<Function, Function>();
-
+    function suppressed(e: Event): boolean {
+        const target = e.currentTarget;
+        if (settings.screenshotBypass) {
+            if ((e.type === "keydown" || e.type === "keyup") && isScreenshotKey(e as KeyboardEvent)) return true;
+            // Snapchat flags any right-click on window as a screenshot attempt
+            if (e.type === "contextmenu" && target === window) return true;
+        }
+        return settings.alwaysFocused && (target === window || target === document)
+            && (e.type === "blur" || e.type === "focus" || e.type === "visibilitychange");
+    }
+    const WRAPPED_EVENTS = new Set(["keydown", "keyup", "contextmenu", "blur", "focus", "visibilitychange"]);
+    const wrappers = new WeakMap<Function, Function>();
     EventTarget.prototype.addEventListener = function (type: string, listener: any, options?: any) {
-        if (settings.alwaysFocused && (this === window || this === document)
-            && (type === "blur" || type === "focus" || type === "visibilitychange")) return;
-        // Snapchat flags any right-click on window as a screenshot attempt
-        if (settings.screenshotBypass && this === window && type === "contextmenu") return;
-        if (settings.screenshotBypass && (type === "keydown" || type === "keyup") && typeof listener === "function") {
+        if (WRAPPED_EVENTS.has(type) && typeof listener === "function") {
             const original = listener;
-            let wrapped = keyWrappers.get(original);
+            let wrapped = wrappers.get(original);
             if (!wrapped) {
-                wrapped = function (this: any, e: KeyboardEvent) {
-                    if (isScreenshotKey(e)) return log("blocked screenshot key", e.key);
+                wrapped = function (this: any, e: Event) {
+                    if (suppressed(e)) return log("suppressed", e.type);
                     return original.call(this, e);
                 };
-                keyWrappers.set(original, wrapped);
+                wrappers.set(original, wrapped);
             }
             listener = wrapped;
         }
         return origAdd.call(this, type, listener, options);
     };
     EventTarget.prototype.removeEventListener = function (type: string, listener: any, options?: any) {
-        return origRemove.call(this, type, keyWrappers.get(listener) ?? listener, options);
+        return origRemove.call(this, type, wrappers.get(listener) ?? listener, options);
     };
 
     // ---- Media helpers
@@ -228,6 +259,55 @@
             await new Promise((r) => setTimeout(r, 300)); // browsers drop bursts of downloads
         }
         return media.length;
+    }
+
+    // ---- Keep deleted messages
+    // Snapchat's message list isn't virtualized: an <li> leaving an open conversation means the message was removed.
+    // We put a greyed copy back where it was. Moves/re-renders are filtered by checking the content is still on screen.
+    function setupDeletedKeeper() {
+        type Removed = { node: HTMLLIElement; parent: Node; next: Node | null; path: string };
+        const pending: Removed[] = [];
+        let timer = 0;
+        const fingerprint = (n: Element) => (n.textContent || "").trim()
+            + [...n.querySelectorAll("img, video, audio, source")].map((m: any) => m.currentSrc || m.src || "").join("|");
+        const isConversation = () => /^\/web\/[0-9a-f-]{36}/.test(location.pathname);
+
+        new MutationObserver((records) => {
+            if (!settings.keepDeleted || !isConversation()) return;
+            for (const r of records) {
+                for (const n of r.removedNodes) {
+                    if (!(n instanceof HTMLLIElement) || "seGhost" in n.dataset) continue;
+                    const parent = r.target as Element;
+                    if (parent.closest("nav") || !fingerprint(n)) continue; // friend feed / story row reorder
+                    pending.push({ node: n, parent, next: r.nextSibling, path: location.pathname });
+                }
+            }
+            if (pending.length) {
+                clearTimeout(timer);
+                timer = window.setTimeout(flush, 400);
+            }
+        }).observe(document.body, { childList: true, subtree: true });
+
+        function flush() {
+            const removed = pending.splice(0);
+            // A conversation switch tears down the whole list at once: nothing to keep
+            if (removed.length > 15) return;
+            const onScreen = new Set([...document.querySelectorAll("li")].map(fingerprint));
+            for (const p of removed) {
+                if (location.pathname !== p.path || !p.parent.isConnected) continue;
+                const fp = fingerprint(p.node);
+                if (onScreen.has(fp) || [...onScreen].some((s) => s.includes(fp))) continue; // moved, not deleted
+                const ghost = p.node.cloneNode(true) as HTMLLIElement;
+                ghost.dataset.seGhost = "";
+                ghost.style.cssText += ";opacity:.6;";
+                const badge = document.createElement("div");
+                badge.textContent = t("🗑 Deleted", "🗑 Supprimé");
+                badge.style.cssText = "color:#e5484d;font:600 11px system-ui,sans-serif;margin:2px 0 0 8px";
+                ghost.prepend(badge);
+                p.parent.insertBefore(ghost, p.next && p.next.parentNode === p.parent ? p.next : null);
+                log("kept deleted message", fp.slice(0, 60));
+            }
+        }
     }
 
     // ---- Settings GUI
@@ -285,11 +365,8 @@
         .dlall:disabled { opacity: .5; cursor: default; }
         footer { display: flex; align-items: center; gap: 8px; padding: 10px 14px; border-top: 1px solid #2c2e33; }
         footer .hint { flex: 1; color: #888; font-size: 11.5px; }
-        footer .hint.dirty { color: #FFFC00; }
         footer button { border: none; border-radius: 8px; padding: 6px 12px; cursor: pointer; font-size: 12.5px; font-weight: 600; }
         .reset { background: #2c2e33; color: #ddd; }
-        .reload { background: #FFFC00; color: #111; }
-        .reload:disabled { opacity: .35; cursor: default; }
         .custom { display: flex; flex-direction: column; align-items: stretch; gap: 3px; padding: 10px 14px 12px; border-top: 1px solid #2c2e33; }
         .custom small { color: #999; font-size: 11.5px; line-height: 1.3; }
         textarea {
@@ -306,14 +383,11 @@
         .dl[hidden] { display: none; }
         @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
     `;
-    const HINT = t("Alt+Shift+S · drag 👻 to move it", "Alt+Maj+S · fais glisser 👻 pour le déplacer");
 
     function mountGui() {
-        if (settings.mediaDownload) {
-            const style = document.createElement("style");
-            style.textContent = "img, video, audio { pointer-events: auto !important; }";
-            document.head.append(style);
-        }
+        const mediaStyle = document.createElement("style");
+        mediaStyle.textContent = "img, video, audio { pointer-events: auto !important; }";
+        document.head.append(mediaStyle);
 
         const host = document.createElement("div");
         const root = host.attachShadow({ mode: "closed" });
@@ -324,7 +398,7 @@
                 <header><b>SnapEnhance Web</b><span class="ver">v${VERSION}</span>
                     <button class="close" aria-label="${t("Close", "Fermer")}">×</button></header>
                 <div class="list">
-                    ${settings.mediaDownload ? `<div class="tools"><button class="dlall">${t("⬇ Download all media in this chat", "⬇ Télécharger tous les médias du chat")}</button></div>` : ""}
+                    <div class="tools"><button class="dlall">${t("⬇ Download all media in this chat", "⬇ Télécharger tous les médias du chat")}</button></div>
                     ${Object.entries(FEATURES).map(([k, [label, desc]]) => `
                     <label><span>${label}<small>${desc}</small></span>
                     <input type="checkbox" role="switch" data-key="${k}"></label>`).join("")}
@@ -333,8 +407,8 @@
                                    "Un morceau d'URL par ligne, copié depuis F12 → Réseau. Sert à réparer une fonction après une mise à jour de Snapchat.")}</small>
                         <textarea spellcheck="false" placeholder="ex. MessagingCoreService/UpdateConversation"></textarea></label>
                 </div>
-                <footer><span class="hint"></span>
-                    <button class="reset">${t("Reset", "Réinitialiser")}</button><button class="reload" disabled>${t("Reload", "Recharger")}</button></footer>
+                <footer><span class="hint">${t("Changes apply instantly · Alt+Shift+S · drag 👻 to move it", "Appliqué tout de suite · Alt+Maj+S · fais glisser 👻 pour le déplacer")}</span>
+                    <button class="reset">${t("Reset", "Réinitialiser")}</button></footer>
             </div>
             <button class="dl" aria-label="${t("Download media", "Télécharger le média")}" title="${t("Download", "Télécharger")}" hidden>
                 <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.2"
@@ -342,19 +416,19 @@
         document.body.append(host);
 
         const $ = (sel: string) => root.querySelector(sel) as HTMLElement;
-        const fab = $(".fab"), panel = $(".panel"), hint = $(".hint"), reload = $(".reload") as HTMLButtonElement;
+        const fab = $(".fab"), panel = $(".panel"), tools = $(".tools");
         const boxes = [...root.querySelectorAll("input")] as HTMLInputElement[];
         const blocklist = root.querySelector("textarea")!;
-        const saved = JSON.stringify(settings);
-        const draft: Settings = { ...settings };
-        blocklist.value = savedBlocklist;
+        blocklist.value = localStorage.getItem(BLOCKLIST_KEY) || "";
 
         const render = () => {
-            boxes.forEach((b) => (b.checked = draft[b.dataset.key as Key]));
-            const dirty = JSON.stringify(draft) !== saved || blocklist.value !== savedBlocklist;
-            reload.disabled = !dirty;
-            hint.textContent = dirty ? t("Reload to apply changes", "Recharge pour appliquer") : HINT;
-            hint.classList.toggle("dirty", dirty);
+            boxes.forEach((b) => (b.checked = settings[b.dataset.key as Key]));
+            tools.hidden = !settings.mediaDownload;
+            mediaStyle.disabled = !settings.mediaDownload;
+        };
+        const apply = (next: Settings) => {
+            saveAndBroadcast(next, blocklist.value);
+            render();
         };
         const placePanel = () => {
             const r = fab.getBoundingClientRect();
@@ -410,25 +484,14 @@
             dragged = false;
         });
 
-        boxes.forEach((b) => origAdd.call(b, "change", () => {
-            draft[b.dataset.key as Key] = b.checked;
-            localStorage.setItem(STORAGE_KEY, JSON.stringify(draft));
-            render();
-        }));
-        origAdd.call(blocklist, "input", () => {
-            localStorage.setItem(BLOCKLIST_KEY, blocklist.value);
-            render();
-        });
+        boxes.forEach((b) => origAdd.call(b, "change", () => apply({ ...settings, [b.dataset.key as Key]: b.checked })));
+        origAdd.call(blocklist, "input", () => apply(settings));
         origAdd.call($(".reset"), "click", () => {
-            Object.assign(draft, DEFAULTS);
             blocklist.value = "";
-            localStorage.removeItem(STORAGE_KEY);
-            localStorage.removeItem(BLOCKLIST_KEY);
             localStorage.removeItem(POSITION_KEY);
             fab.removeAttribute("style");
-            render();
+            apply({ ...DEFAULTS });
         });
-        origAdd.call(reload, "click", () => location.reload());
         origAdd.call($(".close"), "click", () => toggle(false));
         origAdd.call(window, "keydown", (e: any) => {
             if (e.altKey && e.shiftKey && e.code === "KeyS") {
@@ -444,8 +507,8 @@
             if (!panel.hidden && !e.composedPath().includes(host)) toggle(false);
         }, true);
 
-        const dlAll = root.querySelector(".dlall") as HTMLButtonElement | null;
-        if (dlAll) origAdd.call(dlAll, "click", async () => {
+        const dlAll = $(".dlall") as HTMLButtonElement;
+        origAdd.call(dlAll, "click", async () => {
             const label = dlAll.textContent;
             dlAll.disabled = true;
             dlAll.textContent = t("Downloading…", "Téléchargement…");
@@ -455,7 +518,8 @@
         });
 
         render();
-        if (settings.mediaDownload) setupDownloadButton(host, $(".dl") as HTMLButtonElement);
+        setupDownloadButton(host, $(".dl") as HTMLButtonElement);
+        setupDeletedKeeper();
     }
 
     function setupDownloadButton(host: HTMLElement, dl: HTMLButtonElement) {
@@ -470,7 +534,7 @@
             queued = true;
             requestAnimationFrame(() => {
                 queued = false;
-                target = findMedia(e.clientX, e.clientY);
+                target = settings.mediaDownload ? findMedia(e.clientX, e.clientY) : null;
                 dl.hidden = !target;
                 if (!target) return;
                 const r = target.getBoundingClientRect();

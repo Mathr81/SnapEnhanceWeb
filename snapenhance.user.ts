@@ -2,7 +2,7 @@
 // @name         SnapEnhance Web
 // @namespace    snapenhance-web
 // @description  A userscript to Enhance the User experience on Snapchat Web
-// @version      1.4.1
+// @version      1.5.0
 // @author       SnapEnhance
 // @source       https://github.com/Mathr81/SnapEnhanceWeb/
 // @license      GPL-3.0-only
@@ -16,7 +16,7 @@
 // ==/UserScript==
 (function () {
     "use strict";
-    const VERSION = "1.4.1";
+    const VERSION = "1.5.0";
     const STORAGE_KEY = "snapenhance-web:settings";
     const BLOCKLIST_KEY = "snapenhance-web:blocklist";
     const POSITION_KEY = "snapenhance-web:button-position";
@@ -29,6 +29,7 @@
         uploadSizeBypass: [t("Bypass upload size", "Pas de limite de taille"), t("Send files bigger than Snapchat's limit", "Envoyer des fichiers plus gros que la limite de Snapchat"), true],
         storyReadReceipts: [t("Hide story views", "Vues de story invisibles"), t("Watch stories without showing up in viewers", "Regarder les stories sans apparaître dans les vues"), true],
         chatReadReceipts: [t("Hide chat read receipts", "Pas d'accusé de lecture"), t("Read messages without marking them as seen", "Lire les messages sans qu'ils passent en « Vu »"), true],
+        snapReadReceipts: [t("Open snaps anonymously", "Ouvrir les snaps en anonyme"), t("Red/purple snaps stay unopened for the sender. Also blocks saving, reacting and deleting messages", "Les snaps rouges/violets restent « non ouverts » chez l'envoyeur. Bloque aussi enregistrer, réagir et supprimer un message"), true],
         hideBitmoji: [t("Hide bitmoji & typing", "Cacher bitmoji et « écrit… »"), t("Friends don't see you in the chat or typing (blocks presence messages)", "Tes amis ne te voient pas dans le chat ni en train d'écrire"), true],
         screenshotBypass: [t("Bypass screenshot detection", "Captures d'écran non détectées"), t("PrintScreen, Win/Cmd+Shift, Ctrl+Shift and right-click no longer trigger it", "Impr. écran, Win/Cmd+Maj, Ctrl+Maj et clic droit ne déclenchent plus rien"), true],
         alwaysFocused: [t("Stay focused", "Toujours actif"), t("No blur or away state when you switch windows", "Pas de flou ni d'état « absent » quand tu changes de fenêtre"), true],
@@ -93,6 +94,8 @@
         const blocked = [...extra];
         if (s.chatReadReceipts) blocked.push("messagingcoreservice.MessagingCoreService/UpdateConversation");
         if (s.hideBitmoji) blocked.push("messagingcoreservice.MessagingCoreService/SendTypingNotification");
+        // Per-message state (viewed, replayed, saved, reacted...): no way to tell actions apart without decoding protobuf
+        if (s.snapReadReceipts) blocked.push("MessagingCoreService/UpdateContentMessage", "MessagingCoreService/BatchUpdateContentMessages");
         if (s.blockTracking) blocked.push(...tracking);
 
         if (s.hideBitmoji) {

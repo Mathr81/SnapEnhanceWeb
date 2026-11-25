@@ -2,7 +2,7 @@
 // @name         SnapEnhance Web
 // @namespace    snapenhance-web
 // @description  A userscript to Enhance the User experience on Snapchat Web
-// @version      1.7.0
+// @version      1.8.0
 // @author       SnapEnhance
 // @source       https://github.com/Mathr81/SnapEnhanceWeb/
 // @license      GPL-3.0-only
@@ -16,7 +16,7 @@
 // ==/UserScript==
 (function () {
     "use strict";
-    const VERSION = "1.7.0";
+    const VERSION = "1.8.0";
     const STORAGE_KEY = "snapenhance-web:settings";
     const BLOCKLIST_KEY = "snapenhance-web:blocklist";
     const POSITION_KEY = "snapenhance-web:button-position";
@@ -248,8 +248,8 @@
     // Returns null when the parts can't be merged losslessly (different codecs or settings).
     function concatMp4(files: Uint8Array[]): Uint8Array | null {
         type Box = { type: string; start: number; size: number; hdr: number };
-        type Sample = { file: number; off: number; size: number; dur: number; cto: number; sync: boolean };
-        type Track = { handler: string; ts: number; stsd: Uint8Array; samples: Sample[]; editStart: number; hasCtts: boolean; trak: Box };
+        type Sample = { file: number; off: number; size: number; dur: number; cto: number; sync: boolean; desc: number };
+        type Track = { handler: string; ts: number; stsd: Uint8Array; samples: Sample[]; editStart: number; hasCtts: boolean; trak: Box; buf: Uint8Array };
         const u32 = (b: Uint8Array, o: number) => ((b[o] << 24) | (b[o + 1] << 16) | (b[o + 2] << 8) | b[o + 3]) >>> 0;
         const u64 = (b: Uint8Array, o: number) => u32(b, o) * 2 ** 32 + u32(b, o + 4);
         const children = (b: Uint8Array, start: number, end: number) => {
@@ -279,7 +279,7 @@
             if (!stsd || !stts || !stsz || !stsc || !stco) return null;
             const n = u32(b, body(stsz) + 8), fixed = u32(b, body(stsz) + 4);
             const samples: Sample[] = [];
-            for (let i = 0; i < n; i++) samples.push({ file, off: 0, size: fixed || u32(b, body(stsz) + 12 + i * 4), dur: 0, cto: 0, sync: true });
+            for (let i = 0; i < n; i++) samples.push({ file, off: 0, size: fixed || u32(b, body(stsz) + 12 + i * 4), dur: 0, cto: 0, sync: true, desc: 0 });
             // decoding durations
             let i = 0;
             for (let e = 0, c = u32(b, body(stts) + 4); e < c; e++)
@@ -315,7 +315,7 @@
                     if (mediaTime >= 0 && mediaTime < 2 ** 53 - 1 && mediaTime !== 0xffffffff) { editStart = mediaTime; break; }
                 }
             }
-            return { handler, ts, stsd: b.slice(stsd.start, stsd.start + stsd.size), samples, editStart, hasCtts: !!ctts, trak };
+            return { handler, ts, stsd: b.slice(stsd.start, stsd.start + stsd.size), samples, editStart, hasCtts: !!ctts, trak, buf: b };
         }
 
         // Parse every part
@@ -349,27 +349,39 @@
             const x = codecKey(a), y = codecKey(b);
             return x.length === y.length && x.every((v, i) => v === y[i]);
         };
-        for (const p of parts) {
-            if (p!.video.ts !== first.video.ts || !same(p!.video.stsd, first.video.stsd)) return null;
-            if (!!p!.audio !== !!first.audio) return null;
-            if (p!.audio && (p!.audio.ts !== first.audio!.ts || !same(p!.audio.stsd, first.audio!.stsd))) return null;
-        }
+        // Parts encoded with different settings still go into one file: each distinct configuration becomes
+        // its own sample description, and every sample points to the one of its part.
+        const audioTemplate = parts.find((p) => p!.audio)?.audio;
+        const videoDescs: Uint8Array[] = [], audioDescs: Uint8Array[] = [];
+        const descOf = (list: Uint8Array[], stsd: Uint8Array) => {
+            let i = list.findIndex((d) => same(d, stsd));
+            if (i < 0) i = list.push(stsd) - 1;
+            return i;
+        };
+        // Retime a part's samples to the output track's timescale when it differs
+        // shift: composition offset added so every part has the first part's display delay (B-frames or not)
+        const retime = (t: Track, ts: number, desc: number, shift = 0) => t.samples.map((s) => ({
+            ...s, desc, dur: Math.round((s.dur * ts) / t.ts), cto: Math.round((s.cto * ts) / t.ts) + shift,
+        }));
 
         // Merge samples: all video; audio after its priming (edit start), cut to the cumulated video length
         const video: Sample[] = [], audio: Sample[] = [];
         let videoEnd = 0, audioEnd = 0; // seconds
         for (const p of parts as NonNullable<(typeof parts)[number]>[]) {
-            video.push(...p.video.samples);
-            videoEnd += p.video.samples.reduce((s, x) => s + x.dur, 0) / p.video.ts;
-            if (!p.audio) continue;
+            const delay = first.video.editStart - Math.round((p.video.editStart * first.video.ts) / p.video.ts);
+            const vs = retime(p.video, first.video.ts, descOf(videoDescs, p.video.stsd), delay);
+            video.push(...vs);
+            videoEnd += vs.reduce((s, x) => s + x.dur, 0) / first.video.ts;
+            if (!p.audio || !audioTemplate) continue;
+            const ts = audioTemplate.ts, skip = Math.round((p.audio.editStart * ts) / p.audio.ts);
             let t = 0;
-            for (const s of p.audio.samples) {
+            for (const s of retime(p.audio, ts, descOf(audioDescs, p.audio.stsd))) {
                 const start = t;
                 t += s.dur;
-                if (start + s.dur <= p.audio.editStart) continue; // encoder priming
-                if (audioEnd + s.dur / p.audio.ts / 2 > videoEnd) break; // keep A/V aligned at the cut
+                if (start + s.dur <= skip) continue; // encoder priming
+                if (audioEnd + s.dur / ts / 2 > videoEnd) break; // keep A/V aligned at the cut
                 audio.push(s);
-                audioEnd += s.dur / p.audio.ts;
+                audioEnd += s.dur / ts;
             }
         }
 
@@ -396,13 +408,15 @@
             return out;
         };
         const firstBuf = files[0];
-        const copy = (b: Box) => firstBuf.slice(b.start, b.start + b.size);
+        const copy = (b: Box, buf = firstBuf) => buf.slice(b.start, b.start + b.size);
 
         // Sample tables: one sample per chunk keeps stco trivial; offsets are patched once mdat's position is known
-        const stbl = (t: Track, samples: Sample[], offsets: number[]) => {
+        const stbl = (t: Track, samples: Sample[], offsets: number[], descs: Uint8Array[]) => {
             const durations = rle(samples.map((s) => s.dur));
-            const parts = [t.stsd, full("stts", 0, be(durations.length, ...durations.flat()))];
-            if (t.hasCtts) {
+            // stsd = header (8) + version/flags (4) + entry count (4) + entries: keep one entry per configuration
+            const stsd = descs.length === 1 ? descs[0] : full("stsd", 0, be(descs.length), ...descs.map((d) => d.subarray(16)));
+            const parts = [stsd, full("stts", 0, be(durations.length, ...durations.flat()))];
+            if (samples.some((s) => s.cto !== 0)) {
                 const r = rle(samples.map((s) => s.cto));
                 parts.push(full("ctts", r.some(([, v]) => v < 0) ? 1 : 0, be(r.length, ...r.flat())));
             }
@@ -411,36 +425,38 @@
                 parts.push(full("stss", 0, be(sync.length, ...sync)));
             }
             parts.push(full("stsz", 0, be(0, samples.length, ...samples.map((s) => s.size))));
-            parts.push(full("stsc", 0, be(1, 1, 1, 1)));
+            // one sample per chunk; a new stsc run wherever the sample description changes
+            const runs = samples.flatMap((s, i) => (i === 0 || s.desc !== samples[i - 1].desc ? [[i + 1, 1, s.desc + 1]] : []));
+            parts.push(full("stsc", 0, be(runs.length, ...runs.flat())));
             parts.push(full("stco", 0, be(samples.length, ...offsets)));
             return box("stbl", ...parts);
         };
         const mediaDur = (samples: Sample[]) => samples.reduce((s, x) => s + x.dur, 0);
         // Copy a mvhd/mdhd/tkhd box with a new duration. Field position after the header, version 0 / 1:
         // mvhd, mdhd: flags, 2 dates, timescale → 16 / 24. tkhd: flags, 2 dates, track id, reserved → 20 / 28.
-        const withDuration = (b: Box, dur: number) => {
-            const out = copy(b), v = out[b.hdr];
+        const withDuration = (b: Box, dur: number, buf = firstBuf) => {
+            const out = copy(b, buf), v = out[b.hdr];
             const p = b.hdr + (b.type === "tkhd" ? (v ? 28 : 20) : (v ? 24 : 16));
             const dv = new DataView(out.buffer);
             if (v) { dv.setUint32(p, Math.floor(dur / 2 ** 32)); dv.setUint32(p + 4, dur >>> 0); } else dv.setUint32(p, dur);
             return out;
         };
 
-        function trak(t: Track, samples: Sample[], offsets: number[], movieTs: number) {
-            const b = firstBuf, dur = mediaDur(samples), movieDur = Math.round((dur * movieTs) / t.ts);
+        function trak(t: Track, samples: Sample[], offsets: number[], descs: Uint8Array[], movieTs: number) {
+            const b = t.buf, dur = mediaDur(samples), movieDur = Math.round((dur * movieTs) / t.ts);
             const kids = children(b, body(t.trak), t.trak.start + t.trak.size);
             return box("trak", ...kids.flatMap((k) => {
-                if (k.type === "tkhd") return [withDuration(k, movieDur)];
+                if (k.type === "tkhd") return [withDuration(k, movieDur, b)];
                 if (k.type === "edts") {
                     if (t.handler !== "vide" || !t.editStart) return []; // audio priming already cut out
                     const shown = Math.max(0, movieDur - Math.round((t.editStart * movieTs) / t.ts));
                     return [box("edts", full("elst", 0, be(1, shown, t.editStart, 0x10000)))];
                 }
-                if (k.type !== "mdia") return [copy(k)];
+                if (k.type !== "mdia") return [copy(k, b)];
                 return [box("mdia", ...children(b, body(k), k.start + k.size).map((m) => {
-                    if (m.type === "mdhd") return withDuration(m, dur);
-                    if (m.type !== "minf") return copy(m);
-                    return box("minf", ...children(b, body(m), m.start + m.size).map((s) => (s.type === "stbl" ? stbl(t, samples, offsets) : copy(s))));
+                    if (m.type === "mdhd") return withDuration(m, dur, b);
+                    if (m.type !== "minf") return copy(m, b);
+                    return box("minf", ...children(b, body(m), m.start + m.size).map((s) => (s.type === "stbl" ? stbl(t, samples, offsets, descs) : copy(s, b))));
                 }))];
             }));
         }
@@ -448,12 +464,16 @@
         function moov(offsets: { v: number[]; a: number[] }) {
             const b = firstBuf, movieTs = first.movieTs;
             const vDur = Math.round((mediaDur(video) * movieTs) / first.video.ts);
-            const aDur = first.audio ? Math.round((mediaDur(audio) * movieTs) / first.audio.ts) : 0;
+            const aDur = audioTemplate ? Math.round((mediaDur(audio) * movieTs) / audioTemplate.ts) : 0;
             return box("moov", ...children(b, body(first.moov), first.moov.start + first.moov.size).flatMap((k) => {
                 if (k.type === "mvhd") return [withDuration(k, Math.max(vDur, aDur))];
                 if (k.type !== "trak") return [copy(k)];
-                if (k.start === first.video.trak.start) return [trak(first.video, video, offsets.v, movieTs)];
-                if (first.audio && k.start === first.audio.trak.start) return [trak(first.audio, audio, offsets.a, movieTs)];
+                if (k.start === first.video.trak.start) {
+                    // first part without sound: the audio track comes from a later part
+                    const late = !first.audio && audioTemplate ? [trak(audioTemplate, audio, offsets.a, audioDescs, movieTs)] : [];
+                    return [trak(first.video, video, offsets.v, videoDescs, movieTs), ...late];
+                }
+                if (first.audio && k.start === first.audio.trak.start) return [trak(first.audio, audio, offsets.a, audioDescs, movieTs)];
                 return [];
             }));
         }
@@ -610,11 +630,19 @@
         const seen = new Set<string>();
         const media = [...document.querySelectorAll("img, video, audio")].filter(isDownloadable)
             .filter((m) => !seen.has(mediaSrc(m)) && !!seen.add(mediaSrc(m)));
+        const done = new Set<Element>(); // parts of a long video already saved as one file
+        let files = 0;
         for (const m of media) {
-            await downloadMedia(m);
-            await new Promise((r) => setTimeout(r, 300)); // browsers drop bursts of downloads
+            const li = m.closest("li");
+            if (li && done.has(li)) continue;
+            if (m instanceof HTMLVideoElement && isSlot(li) && partCount(li) > 1) {
+                adjacentSlots(li).forEach((s) => done.add(s));
+                await downloadVideo(m);
+            } else await downloadMedia(m);
+            files++;
+            await sleep(300); // browsers drop bursts of downloads
         }
-        return media.length;
+        return files;
     }
 
     // ---- Keep deleted messages

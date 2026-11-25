@@ -2,7 +2,7 @@
 // @name         SnapEnhance Web
 // @namespace    snapenhance-web
 // @description  A userscript to Enhance the User experience on Snapchat Web
-// @version      1.4.0
+// @version      1.4.1
 // @author       SnapEnhance
 // @source       https://github.com/Mathr81/SnapEnhanceWeb/
 // @license      GPL-3.0-only
@@ -16,7 +16,7 @@
 // ==/UserScript==
 (function () {
     "use strict";
-    const VERSION = "1.4.0";
+    const VERSION = "1.4.1";
     const STORAGE_KEY = "snapenhance-web:settings";
     const BLOCKLIST_KEY = "snapenhance-web:blocklist";
     const POSITION_KEY = "snapenhance-web:button-position";
@@ -251,6 +251,13 @@
         header .ver { color: #888; font-size: 11px; }
         header .close { margin-left: auto; background: none; border: none; color: #aaa; font-size: 20px; cursor: pointer; line-height: 1; }
         .list { overflow-y: auto; padding: 4px 0; }
+        /* Chrome ignores ::-webkit-scrollbar (and shows arrows) once scrollbar-color is set: Firefox only */
+        @supports not selector(::-webkit-scrollbar) { .list, textarea { scrollbar-width: thin; scrollbar-color: #3a3c42 transparent; } }
+        ::-webkit-scrollbar { width: 8px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: #3a3c42; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #55575e; }
+        ::-webkit-scrollbar-button { display: none; }
         label { display: flex; align-items: center; gap: 12px; padding: 9px 14px; cursor: pointer; }
         label:hover { background: #1f2125; }
         label span { flex: 1; display: flex; flex-direction: column; gap: 2px; }

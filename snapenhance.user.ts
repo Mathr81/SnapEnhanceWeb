@@ -921,13 +921,14 @@
     function setupDownloadButton(host: HTMLElement, dl: HTMLButtonElement) {
         let target: Media | null = null;
         let queued = false;
-        // elementsFromPoint sees media even under Snapchat's overlays
+        // elementsFromPoint sees media even under Snapchat's overlays. Video snaps show a still <img> on top of
+        // their <video> (thumbnails and viewer): when a video is there, it's what the user wants, not the still.
         const findMedia = (x: number, y: number) => {
-            for (const el of document.elementsFromPoint(x, y)) {
-                const m = el.matches("[role=button]") ? el.querySelector("video, img") : el;
-                if (m && isDownloadable(m)) return m;
-            }
-            return null;
+            const found = document.elementsFromPoint(x, y).flatMap((el) => {
+                const box = el.closest("[role=button]");
+                return box ? [...box.querySelectorAll("video, img")] : [el];
+            }).filter(isDownloadable);
+            return found.find((m) => m instanceof HTMLVideoElement) ?? found[0] ?? null;
         };
 
         origAdd.call(document, "pointermove", (e: any) => {
